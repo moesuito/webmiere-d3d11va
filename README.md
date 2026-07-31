@@ -61,7 +61,7 @@ Video-only files remain supported.
 
 [Download WebMiere-Setup.exe](https://github.com/KawaiiEngine/WebMiere/releases/latest/download/WebMiere-Setup.exe)
 
-WebMiere is unsigned because the signing money went to chocolate.
+WebMiere remains unsigned because the signing money keeps going to chocolate.
 
 If SmartScreen appears, select **More info** → **Run anyway**.
 
