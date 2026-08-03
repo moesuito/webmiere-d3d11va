@@ -529,6 +529,10 @@ Vp9oFiletypeForPath(const prUTF16Char *path)
 		{
 			return WEBMIERE_FILETYPE_MKV;
 		}
+		if (ext[0] == '.' && c1 == 'm' && c2 == 'p' && c3 == '4')
+		{
+			return WEBMIERE_FILETYPE_MP4;
+		}
 	}
 
 	return WEBMIERE_FILETYPE_WEBM;
@@ -1098,8 +1102,8 @@ SDKInit(
 	importInfo->dontCache			= kPrFalse;
 	importInfo->keepLoaded			= kPrFalse;
 
-	// 224 = Feb. 24, the birthday of Mina, KawaiiEngine's official mascot.
-	importInfo->priority			= 224;
+	// Run before Premiere's MP4 importer; ProbeMedia returns imBadFile for non-AV1 MP4.
+	importInfo->priority			= 1000;
 
 
 	if (stdParms->imInterfaceVer >= IMPORTMOD_VERSION_6)
@@ -1155,6 +1159,18 @@ SDKGetIndFormat(
 			formatRec->canWriteTimecode	= kPrFalse;
 			formatRec->flags			= xfCanImport | xfCanOpen | xfIsMovie;
 			strcpy_s(formatRec->FormatName,        sizeof(formatRec->FormatName),        formatName);
+			strcpy_s(formatRec->FormatShortName,   sizeof(formatRec->FormatShortName),   shortName);
+			strcpy_s(formatRec->PlatformExtension, sizeof(formatRec->PlatformExtension), ext);
+			break;
+		}
+
+		case 2:
+		{
+			char ext[256] = "mp4";
+			formatRec->filetype			= WEBMIERE_FILETYPE_MP4;
+			formatRec->canWriteTimecode	= kPrFalse;
+			formatRec->flags			= xfCanImport | xfCanOpen | xfIsMovie;
+			strcpy_s(formatRec->FormatName,        sizeof(formatRec->FormatName),        WEBMIERE_MP4_FORMAT_NAME);
 			strcpy_s(formatRec->FormatShortName,   sizeof(formatRec->FormatShortName),   shortName);
 			strcpy_s(formatRec->PlatformExtension, sizeof(formatRec->PlatformExtension), ext);
 			break;

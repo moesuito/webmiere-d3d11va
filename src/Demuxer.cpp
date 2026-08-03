@@ -78,10 +78,80 @@ static WebMiereCodec MapCodec(int avCodecId)
 }
 
 
-static bool IsSupportedVideoCodec(WebMiereCodec codec)
+static bool FormatNameContains(const char *formatNames, const char *wanted)
 {
-	return codec == WEBMIERE_CODEC_VP9 ||
-		   codec == WEBMIERE_CODEC_AV1;
+	if (formatNames == nullptr || wanted == nullptr || wanted[0] == '\0')
+	{
+		return false;
+	}
+
+	const size_t wantedLength = std::strlen(wanted);
+	const char *name = formatNames;
+	while (*name != '\0')
+	{
+		const char *end = std::strchr(name, ',');
+		const size_t length = (end != nullptr)
+			? static_cast<size_t>(end - name)
+			: std::strlen(name);
+		if (length == wantedLength && std::strncmp(name, wanted, length) == 0)
+		{
+			return true;
+		}
+		if (end == nullptr)
+		{
+			break;
+		}
+		name = end + 1;
+	}
+	return false;
+}
+
+
+static bool PathHasExtension(const std::string &path, const char *extension)
+{
+	if (extension == nullptr)
+	{
+		return false;
+	}
+	const size_t extensionLength = std::strlen(extension);
+	return path.size() >= extensionLength &&
+		_stricmp(path.c_str() + path.size() - extensionLength, extension) == 0;
+}
+
+
+static WebMiereContainer MapContainer(
+	const AVFormatContext	*fmt,
+	const std::string		&path)
+{
+	const char *formatNames =
+		(fmt != nullptr && fmt->iformat != nullptr) ? fmt->iformat->name : nullptr;
+	if (FormatNameContains(formatNames, "matroska") ||
+		FormatNameContains(formatNames, "webm"))
+	{
+		return PathHasExtension(path, ".webm")
+			? WEBMIERE_CONTAINER_WEBM
+			: WEBMIERE_CONTAINER_MATROSKA;
+	}
+	if (FormatNameContains(formatNames, "mov") ||
+		FormatNameContains(formatNames, "mp4"))
+	{
+		return WEBMIERE_CONTAINER_MP4;
+	}
+	return WEBMIERE_CONTAINER_UNKNOWN;
+}
+
+
+static bool IsSupportedVideoCodec(
+	WebMiereContainer	container,
+	WebMiereCodec		codec)
+{
+	if (container == WEBMIERE_CONTAINER_MP4)
+	{
+		return codec == WEBMIERE_CODEC_AV1;
+	}
+	return (container == WEBMIERE_CONTAINER_WEBM ||
+			container == WEBMIERE_CONTAINER_MATROSKA) &&
+		(codec == WEBMIERE_CODEC_VP9 || codec == WEBMIERE_CODEC_AV1);
 }
 
 
@@ -142,6 +212,13 @@ bool ProbeMedia(const prUTF16Char *path, MediaProbeInfo *out, std::string *errMs
 		return false;
 	}
 
+	out->container = MapContainer(fmt.get(), utf8Path);
+	if (out->container == WEBMIERE_CONTAINER_UNKNOWN)
+	{
+		if (errMsg) *errMsg = "container is not WebM/Matroska or MP4";
+		return false;
+	}
+
 	int vIdx = av_find_best_stream(fmt.get(), AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
 
 
@@ -161,9 +238,14 @@ bool ProbeMedia(const prUTF16Char *path, MediaProbeInfo *out, std::string *errMs
 		out->height			= par->height;
 		out->avPixelFormat	= par->format;
 
-		if (!IsSupportedVideoCodec(out->videoCodec))
+		if (!IsSupportedVideoCodec(out->container, out->videoCodec))
 		{
-			if (errMsg) *errMsg = "video codec is not VP9 or AV1";
+			if (errMsg)
+			{
+				*errMsg = (out->container == WEBMIERE_CONTAINER_MP4)
+					? "MP4 video codec is not AV1"
+					: "video codec is not VP9 or AV1";
+			}
 			return false;
 		}
 		if (!Vp9oIsValidVideoSize(par->width, par->height))
@@ -172,7 +254,7 @@ bool ProbeMedia(const prUTF16Char *path, MediaProbeInfo *out, std::string *errMs
 			return false;
 		}
 
-		const bool isSupportedVideo = IsSupportedVideoCodec(out->videoCodec);
+		const bool isSupportedVideo = IsSupportedVideoCodec(out->container, out->videoCodec);
 		const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(par->format));
 		if (isSupportedVideo && (par->format == AV_PIX_FMT_NONE || desc == nullptr))
 		{

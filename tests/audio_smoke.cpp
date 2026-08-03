@@ -28,7 +28,7 @@ int wmain(int argc, wchar_t **argv)
 {
 	if (argc < 2 || argc > 3)
 	{
-		std::wcerr << L"usage: audio_smoke.exe <media.mkv|media.webm> [audio-stream-ordinal]\n";
+		std::wcerr << L"usage: audio_smoke.exe <media.mkv|media.webm|media.mp4> [audio-stream-ordinal]\n";
 		return 2;
 	}
 

@@ -4,11 +4,11 @@
 
 # WebMiere
 
-**Drop OBS recordings and YouTube-style WebM/MKV media straight into Adobe Premiere Pro.**
+**Drop supported WebM, MKV, and AV1-in-MP4 media straight into Adobe Premiere Pro.**
 
-WebMiere is a native Windows x64 importer for supported OBS multi-track Matroska recordings and YouTube-style `.webm`/`.mkv` media, provided the files match its documented media requirements.
+WebMiere is a native Windows x64 importer for supported OBS multi-track Matroska recordings, YouTube-style `.webm`/`.mkv` media, and AV1 video in `.mp4`.
 
-Import VP9 or AV1 video with up to six independent Opus stereo tracks, exposed separately in Premiere Pro.
+Import VP9 or AV1 video with up to six independent mono or stereo audio tracks, exposed separately in Premiere Pro.
 
 **No ProRes transcode. No proxy prep. No WAV extraction.**
 
@@ -39,18 +39,18 @@ WebMiere uses NVIDIA NVDEC, CUDA, and NPP, and prioritizes responsive timeline e
 
 | Feature | Specification |
 | :--- | :--- |
-| **Source** | Supported OBS recordings and YouTube-style WebM/MKV media |
-| **Containers** | WebM / Matroska (`.webm`, `.mkv`) |
+| **Source** | Supported OBS recordings, YouTube-style WebM/MKV media, and AV1 MP4 |
+| **Containers** | WebM / Matroska (`.webm`, `.mkv`); MP4 (`.mp4`) for AV1 video only |
 | **Video Streams** | Exactly one |
 | **Video** | VP9 Profile 0 / AV1 Main SDR |
 | **Pixel Format** | 8-bit YUV 4:2:0 |
 | **Color** | SDR, BT.709 matrix, limited range |
 | **Frame Rate** | Constant frame rate |
 | **Maximum Dimensions** | 8192 × 4320 |
-| **Audio Codec** | Opus |
+| **Audio Codec** | Any codec with a decoder in the bundled FFmpeg runtime |
 | **Audio Streams** | None, or 1–6 independent streams |
-| **Audio Format** | Stereo, 48 kHz per stream |
-| **Premiere Output** | Separate stereo audio tracks |
+| **Audio Format** | Mono or stereo at the source sample rate |
+| **Premiere Output** | Separate audio tracks |
 
 Video-only files remain supported.
 
@@ -118,12 +118,12 @@ In the media tested so far, YouTube delivery streams have been CFR. True VFR rem
 - VP9 or AV1 4:2:2, 4:4:4, RGB, or alpha
 - HDR, BT.2020, PQ, or HLG media, including AV1 HDR media
 - Full-range video
-- H.264, HEVC, ProRes, and other non-VP9/non-AV1 video codecs
+- H.264, HEVC, and other non-AV1 video inside MP4 (passed back to Premiere's native importer)
+- ProRes and other non-VP9/non-AV1 video inside WebM/Matroska
 - More than one video stream
 - More than six audio streams
-- AAC, Vorbis, and other audio codecs besides Opus
-- Mixed audio sample rates or channel counts, or any sample rate other than 48 kHz
-- Mono, surround, or other multichannel audio
+- Audio codecs without a decoder in the bundled FFmpeg runtime
+- Surround or other audio streams with more than two channels
 - Audio streams with different start times
 
 Unsupported files containing multiple audio streams are rejected as a whole rather than partially imported.
@@ -224,21 +224,21 @@ WebMiere links directly against the NVIDIA driver API; runtime DLLs are preloade
 
 ### A File Does Not Import
 
-A `.webm` or `.mkv` extension does not guarantee compatibility. Compare the file against these requirements:
+A `.webm`, `.mkv`, or `.mp4` extension does not guarantee compatibility. Compare the file against these requirements:
 
 - **Codec:** VP9 Profile 0 or AV1 Main SDR
 - **Frame rate:** Constant frame rate rather than true VFR
 - **Video streams:** Exactly one
 - **Pixel format:** 8-bit YUV 4:2:0
 - **Color:** SDR, BT.709 matrix, limited range
-- **AV1 hardware:** For normal AV1 use, the system has an NVIDIA GPU with AV1 hardware decode support
-- **Audio:** Video-only, or one to six independent Opus stereo streams at 48 kHz
-- **Audio timing:** All enabled audio streams use the same format and begin at the same source time
+- **MP4 ownership:** MP4 must contain AV1 video; H.264 and HEVC remain with Premiere's native importer
+- **Audio:** Video-only, or one to six independent mono/stereo streams supported by bundled FFmpeg
+- **Audio timing:** All enabled audio streams begin at the same source time
 - **File integrity:** Fully downloaded and not truncated
 
 For systems without NVIDIA AV1 hardware decode support, use VP9/Opus media instead of AV1/Opus.
 
-If another importer is installed, WebMiere is designed to take supported VP9/Opus and AV1 SDR/Opus media and pass unsupported media back to Premiere so another importer can handle it.
+WebMiere takes supported VP9/AV1 WebM/MKV and AV1 MP4 media, and passes unsupported media back to Premiere so another importer can handle it.
 
 If a YouTube download that should be supported does not import, download it again before investigating further. Incomplete downloads and unusual remuxing tools can produce files outside the normal supported YouTube-style VP9/Opus or AV1 SDR/Opus shape.
 

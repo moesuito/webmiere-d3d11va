@@ -28,9 +28,19 @@ enum WebMiereCodec
 };
 
 
+enum WebMiereContainer
+{
+	WEBMIERE_CONTAINER_UNKNOWN = 0,
+	WEBMIERE_CONTAINER_WEBM,
+	WEBMIERE_CONTAINER_MATROSKA,
+	WEBMIERE_CONTAINER_MP4
+};
+
+
 struct MediaProbeInfo
 {
 
+	WebMiereContainer container;
 	bool		hasVideo;
 	WebMiereCodec	videoCodec;
 	int			width;
