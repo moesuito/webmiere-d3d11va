@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/webmiere-hero.png" alt="WebMiere - OBS and YouTube-style VP9, AV1, and Opus importer for Adobe Premiere Pro" width="100%">
+  <img src="docs/images/webmiere-hero.png" alt="WebMiere - VP9 and AV1 importer with multi-track audio for Adobe Premiere Pro" width="100%">
 </p>
 
 # WebMiere
@@ -28,12 +28,12 @@ If WebMiere saved you time, you can buy Mina a chocolate.
 ## System Requirements
 |  | VP9 | AV1 |
 | :--- | :--- | :--- |
-| **Platform** | Windows x64 / NVIDIA | Windows x64 / NVIDIA |
-| **GPU** | **RTX 20 Series or Newer**<br><sub>Recommended</sub> | **RTX 30 Series or Newer**<br><sub>Required</sub> |
+| **Platform** | Windows x64 / Direct3D 11 | Windows x64 / Direct3D 11 |
+| **GPU** | D3D11VA VP9 decode support recommended | D3D11VA AV1 decode support recommended |
 | **Host** | Adobe Premiere Pro 26.x | Adobe Premiere Pro 26.x |
-| **Not Supported** | AMD-only, Intel-only, macOS | AMD-only, Intel-only, macOS |
+| **Not Supported** | macOS | macOS |
 
-WebMiere uses NVIDIA NVDEC, CUDA, and NPP, and prioritizes responsive timeline editing over broad format compatibility.
+WebMiere uses FFmpeg D3D11VA for hardware decode on compatible AMD, Intel, and NVIDIA GPUs. D3D11 video processing and compute shaders keep pixel conversion and Premiere proxy-resolution scaling on the GPU; FFmpeg software decode and `swscale` remain automatic fallbacks.
 
 ## Supported Media
 
@@ -130,7 +130,7 @@ Unsupported files containing multiple audio streams are rejected as a whole rath
 
 ## Installation
 
-1. Install or update the NVIDIA graphics driver.
+1. Install or update the graphics driver supplied by AMD, Intel, or NVIDIA.
 2. Close Adobe Premiere Pro.
 3. Launch `WebMiere-Setup.exe`.
 4. If Microsoft Defender SmartScreen displays **“Windows protected your PC”**:
@@ -147,7 +147,7 @@ Default installation path:
 C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\WebMiere
 ```
 
-The installed WebMiere directory must contain `WebMiere.prm` and the matching `ffmpeg` and `nvidia` runtime subdirectories supplied with that release. Do not mix FFmpeg, CUDA, or NPP files from different WebMiere builds.
+The installed WebMiere directory must contain `WebMiere.prm`, the required artwork policy file, and the matching `ffmpeg` runtime subdirectory supplied with that release. Do not mix FFmpeg files from different WebMiere builds.
 
 A typical installed directory contains:
 
@@ -165,8 +165,6 @@ assets\
     README-FFmpeg.txt
     SHA256SUMS-FFmpeg.txt
     dav1d-COPYING.BSD-2-Clause.txt
-    nv-codec-headers-MIT.txt
-    NVIDIA-CUDA-Toolkit-12.9-EULA.txt
     Microsoft-Visual-Cpp-Redistributable.txt
     THIRD_PARTY_NOTICES.md
     source\
@@ -177,15 +175,9 @@ ffmpeg\
   avutil-60.dll
   swscale-9.dll
   swresample-6.dll
-nvidia\
-  cudart64_12.dll
-  nppc64_12.dll
-  nppicc64_12.dll
-  nppidei64_12.dll
-  nppig64_12.dll
 ```
 
-Driver-provided NVIDIA components such as `nvcuda.dll` are not bundled with WebMiere.
+GPU driver components are supplied by the hardware vendor and are not bundled with WebMiere.
 
 Standard Inno Setup logs are written to the Windows temporary directory. These are installer logs, not WebMiere importer runtime logs.
 
@@ -211,16 +203,15 @@ Review `THIRD_PARTY_NOTICES.md` and the licenses of the exact runtime DLLs. Thir
 
 ### WebMiere Does Not Appear in Premiere
 
-- Confirm that the system has a supported NVIDIA GPU.
-- Install a compatible NVIDIA graphics driver.
-- Confirm that `WebMiere.prm`, `ffmpeg`, and `nvidia` are present in the same `WebMiere` directory.
-- Confirm that the FFmpeg DLLs are in `WebMiere\ffmpeg` and the CUDA/NPP DLLs are in `WebMiere\nvidia`.
+- Install a current AMD, Intel, or NVIDIA graphics driver.
+- Confirm that `WebMiere.prm`, `assets\licenses\ARTWORK_POLICY.md`, and `ffmpeg` are present in the same `WebMiere` directory.
+- Confirm that the five matching FFmpeg DLLs are in `WebMiere\ffmpeg`.
 - Install the Microsoft Visual C++ 2015-2022 Redistributable for x64.
 - Fully restart Premiere Pro.
 - Check the Windows temporary directory for the standard Inno Setup installer log if installation failed.
 - Check Premiere's plugin loading log or use Process Monitor to identify a missing DLL if installation succeeded but the importer does not load.
 
-WebMiere links directly against the NVIDIA driver API; runtime DLLs are preloaded at importer startup. If a required DLL is missing, WebMiere safely refuses to initialize.
+WebMiere preloads its packaged FFmpeg runtime from the plugin directory. If a required DLL or policy asset is missing, WebMiere safely refuses to initialize.
 
 ### A File Does Not Import
 
@@ -236,7 +227,7 @@ A `.webm`, `.mkv`, or `.mp4` extension does not guarantee compatibility. Compare
 - **Audio timing:** All enabled audio streams begin at the same source time
 - **File integrity:** Fully downloaded and not truncated
 
-For systems without NVIDIA AV1 hardware decode support, use VP9/Opus media instead of AV1/Opus.
+If hardware decode is unavailable, WebMiere retries with the packaged FFmpeg software decoder. Timeline performance may be lower on the CPU fallback path.
 
 WebMiere takes supported VP9/AV1 WebM/MKV and AV1 MP4 media, and passes unsupported media back to Premiere so another importer can handle it.
 
