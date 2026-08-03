@@ -4,6 +4,9 @@
 
 # WebMiere
 
+> [!IMPORTANT]
+> This repository is an independent community fork of [KawaiiEngine/WebMiere](https://github.com/KawaiiEngine/WebMiere), maintained by [moesuito](https://github.com/moesuito). It is not an official KawaiiEngine release. WebMiere, Mina, Miere, and the original artwork remain the property of KawaiiEngine (Sashimiso); this fork does not reuse the proprietary installer artwork.
+
 **Drop supported WebM, MKV, and AV1-in-MP4 media straight into Adobe Premiere Pro.**
 
 WebMiere is a native Windows x64 importer for supported OBS multi-track Matroska recordings, YouTube-style `.webm`/`.mkv` media, and AV1 video in `.mp4`.
@@ -54,14 +57,11 @@ WebMiere uses FFmpeg D3D11VA for hardware decode on compatible AMD, Intel, and N
 
 Video-only files remain supported.
 
-> **Not sure whether your file is compatible?**  
-> [Check it with WebMiere Checker](https://kawaiiengine.github.io/WebMiere/checker/) — the check runs entirely in your browser, and nothing is uploaded.
-
 ## Download
 
-[Download WebMiere-Setup.exe](https://github.com/KawaiiEngine/WebMiere/releases/latest/download/WebMiere-Setup.exe)
+[Download the latest community-fork release](https://github.com/moesuito/webmiere-d3d11va/releases/latest)
 
-WebMiere remains unsigned because the signing money keeps going to chocolate.
+The community-fork installer is currently unsigned. Its SHA-256 checksum is published with every release.
 
 If SmartScreen appears, select **More info** → **Run anyway**.
 
@@ -110,6 +110,8 @@ In the media tested so far, YouTube delivery streams have been CFR. True VFR rem
 - Six-track routing and long-duration synchronization were verified against direct FFmpeg decoding using an approximately 15-minute recording and a recording longer than three hours.
 - No measurable audio drift was observed in the tested recordings.
 - Existing single-track AV1 SDR/Opus editing and export behavior was also revalidated.
+- The D3D11VA, GPU scaling, universal-audio, and AV1 MP4 paths were manually validated in Premiere Pro on a Radeon RX 9060 XT and a GeForce RTX 3060 Laptop GPU.
+- No performance regression was observed on the RTX 3060 compared with the original CUDA build; Video Decode/NVDEC and 3D/CUDA telemetry remained at the same observed levels.
 
 ## Unsupported Media
 
@@ -132,13 +134,13 @@ Unsupported files containing multiple audio streams are rejected as a whole rath
 
 1. Install or update the graphics driver supplied by AMD, Intel, or NVIDIA.
 2. Close Adobe Premiere Pro.
-3. Launch `WebMiere-Setup.exe`.
+3. Launch `WebMiere-D3D11VA-Setup-1.3.0.exe`.
 4. If Microsoft Defender SmartScreen displays **“Windows protected your PC”**:
    1. Select **More info**.
-   2. Confirm that the app is `WebMiere-Setup.exe`.
+   2. Confirm that the app is `WebMiere-D3D11VA-Setup-1.3.0.exe`.
    3. Select **Run anyway**.
 5. Choose **Install**.
-6. When Windows asks for permission, allow the WebMiere Worker installer to make changes.
+6. When Windows asks for permission, allow the community-fork installer to make changes.
 7. Start Premiere Pro.
 
 Default installation path:
@@ -154,21 +156,16 @@ A typical installed directory contains:
 ```text
 WebMiere.prm
 assets\
-  WebMiere-App.ico
   licenses\
     ARTWORK_POLICY.md
     README.md
     WebMiere-MPL-2.0.txt
     FFmpeg-COPYING.LGPLv3.txt
-    FFmpeg-COPYING.GPLv3.txt
-    FFmpeg-THIRD-PARTY-NOTICES.txt
-    README-FFmpeg.txt
-    SHA256SUMS-FFmpeg.txt
     dav1d-COPYING.BSD-2-Clause.txt
-    Microsoft-Visual-Cpp-Redistributable.txt
     THIRD_PARTY_NOTICES.md
+    SHA256SUMS.txt
     source\
-      FFmpeg-WebMiere-8.1.2-4-Corresponding-Source.zip
+      WebMiere-D3D11VA-FFmpeg-8.1.2-Corresponding-Source.zip
 ffmpeg\
   avcodec-62.dll
   avformat-62.dll
@@ -184,18 +181,18 @@ Standard Inno Setup logs are written to the Windows temporary directory. These a
 ### Uninstall
 
 1. Close Premiere Pro.
-2. Launch `WebMiere-Setup.exe` and choose `Uninstall`, or uninstall WebMiere from Windows Apps / Installed apps.
+2. Uninstall `WebMiere D3D11VA Community Fork` from Windows Apps / Installed apps.
 3. Restart Premiere Pro.
 
 ## Distribution and Third-Party Source Compliance
 
-Official prebuilt binaries and the installer are distributed through the official WebMiere GitHub Releases unless KawaiiEngine expressly designates another authorized channel.
+Community-fork binaries are distributed only through [moesuito/webmiere-d3d11va Releases](https://github.com/moesuito/webmiere-d3d11va/releases). Official WebMiere releases remain available from KawaiiEngine.
 
-Source files under `src/` are licensed under the Mozilla Public License 2.0. The corresponding source for each official binary release is identified by its release tag or source archive. The installer, artwork, characters, logos, branding, and other materials are not licensed under the MPL unless expressly stated.
+Source files under `src/` are licensed under the Mozilla Public License 2.0. The corresponding source for each community-fork binary release is identified by its release tag and bundled source archive. Artwork, characters, logos, and original branding are not licensed under the MPL unless expressly stated.
 
-The FFmpeg runtime used by WebMiere is built from pinned source revisions. The Official Package includes the corresponding source archive in `assets\licenses\source`, with related build, configuration, license, checksum, diff, and provenance records included under `assets\licenses`.
+The FFmpeg runtime used by this fork is built from pinned source revisions. The installer includes the corresponding FFmpeg/dav1d source archive, build configuration, license texts, and checksums under `assets\licenses`.
 
-Third-party license texts and notices applicable to the distributed binaries are included with the official binary package.
+Third-party license texts and notices applicable to the distributed binaries are included with the community-fork installer.
 
 Review `THIRD_PARTY_NOTICES.md` and the licenses of the exact runtime DLLs. Third-party licenses do not grant rights to the WebMiere installer or its brand assets. Rights in the source files under `src/` are governed separately by the MPL-2.0.
 
@@ -247,7 +244,7 @@ Copyright (c) 2026 KawaiiEngine (Sashimiso).
 
 Source files under `src/` are licensed under the Mozilla Public License 2.0. See [LICENSE](LICENSE).
 
-Official prebuilt binaries and the installer are distributed under separate terms. Those terms do not limit the rights granted under the MPL-2.0 to the source files under `src/`.
+Community-fork binaries and the installer do not limit the rights granted under the MPL-2.0 to the source files under `src/`.
 
 The installer, artwork, characters, logos, branding, and other materials are not licensed under the MPL unless expressly stated.
 
