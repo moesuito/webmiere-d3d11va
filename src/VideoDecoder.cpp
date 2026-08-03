@@ -14,28 +14,14 @@
 #include "WebMiereColorPolicy.h"
 
 #include <windows.h>
+#include <d3d11_3.h>
+#include <d3dcompiler.h>
+#include <wrl/client.h>
 #include <string>
 #include <memory>
 #include <cstring>
 #include <limits>
 #include <new>
-
-
-#ifndef VP9O_ENABLE_NPP
-#define VP9O_ENABLE_NPP 1
-#endif
-
-
-#ifndef VP9O_ENABLE_CUDA_YUV420P_DIRECT
-#define VP9O_ENABLE_CUDA_YUV420P_DIRECT 1
-#endif
-
-#if VP9O_ENABLE_NPP
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <npp.h>
-#endif
-
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -47,12 +33,53 @@ extern "C" {
 #include <libavutil/mathematics.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/hwcontext.h>
-#if VP9O_ENABLE_NPP
-#include <libavutil/hwcontext_cuda.h>
-#endif
+#include <libavutil/hwcontext_d3d11va.h>
 #include <libswscale/swscale.h>
 }
 
+using Microsoft::WRL::ComPtr;
+
+static std::mutex gD3D11ComputeExecutionMutex;
+
+struct Vp9oD3D11State
+{
+	ComPtr<ID3D11Device> device;
+	ComPtr<ID3D11Device3> device3;
+	ComPtr<ID3D11DeviceContext> context;
+	ComPtr<ID3D11VideoDevice> videoDevice;
+	ComPtr<ID3D11VideoContext> videoContext;
+	ComPtr<ID3D11VideoContext1> videoContext1;
+
+	ComPtr<ID3D11VideoProcessorEnumerator> bgraEnumerator;
+	ComPtr<ID3D11VideoProcessor> bgraProcessor;
+	ComPtr<ID3D11Texture2D> bgraTexture;
+	ComPtr<ID3D11VideoProcessorOutputView> bgraOutputView;
+	ComPtr<ID3D11Texture2D> bgraStaging;
+	int bgraSrcW = 0;
+	int bgraSrcH = 0;
+	int bgraDstW = 0;
+	int bgraDstH = 0;
+
+	ComPtr<ID3D11ComputeShader> yuvShader;
+	ComPtr<ID3D11Buffer> yuvConstants;
+	ComPtr<ID3D11SamplerState> yuvSampler;
+	ComPtr<ID3D11Texture2D> nv12Texture;
+	ComPtr<ID3D11ShaderResourceView1> nv12YView;
+	ComPtr<ID3D11ShaderResourceView1> nv12UVView;
+	ComPtr<ID3D11Texture2D> yTexture;
+	ComPtr<ID3D11Texture2D> uTexture;
+	ComPtr<ID3D11Texture2D> vTexture;
+	ComPtr<ID3D11UnorderedAccessView> yUav;
+	ComPtr<ID3D11UnorderedAccessView> uUav;
+	ComPtr<ID3D11UnorderedAccessView> vUav;
+	ComPtr<ID3D11Texture2D> yStaging;
+	ComPtr<ID3D11Texture2D> uStaging;
+	ComPtr<ID3D11Texture2D> vStaging;
+	int yuvSrcW = 0;
+	int yuvSrcH = 0;
+	int yuvDstW = 0;
+	int yuvDstH = 0;
+};
 
 namespace {
 struct AVBufferRefDeleter
@@ -67,85 +94,53 @@ struct AVBufferRefDeleter
 };
 using AVBufferRefGuard = std::unique_ptr<AVBufferRef, AVBufferRefDeleter>;
 
-#if VP9O_ENABLE_NPP
-class CuCtxPushGuard
+class D3D11DeviceLockGuard
 {
 public:
-	explicit CuCtxPushGuard(CUcontext ctx) noexcept
-		: mPushed(cuCtxPushCurrent(ctx) == CUDA_SUCCESS)
+	explicit D3D11DeviceLockGuard(AVD3D11VADeviceContext *ctx) noexcept
+		: mContext(ctx)
 	{
-	}
-
-	~CuCtxPushGuard() noexcept
-	{
-		pop();
-	}
-
-	bool ok() const noexcept
-	{
-		return mPushed;
-	}
-
-	bool pop() noexcept
-	{
-		if (!mPushed)
+		if (mContext != nullptr && mContext->lock != nullptr)
 		{
-			return true;
+			mContext->lock(mContext->lock_ctx);
 		}
-		CUcontext popped = nullptr;
-		const CUresult res = cuCtxPopCurrent(&popped);
-		mPushed = false;
-		return res == CUDA_SUCCESS;
+	}
+
+	~D3D11DeviceLockGuard() noexcept
+	{
+		if (mContext != nullptr && mContext->unlock != nullptr)
+		{
+			mContext->unlock(mContext->lock_ctx);
+		}
 	}
 
 private:
-	bool mPushed;
+	AVD3D11VADeviceContext *mContext;
 };
 
-enum Vp9oCudaSyncMode
-{
-	kVp9oCudaSyncContext = 0,
-	kVp9oCudaSyncProducer = 1,
-	kVp9oCudaSyncSameStream = 2,
-	kVp9oCudaSyncEvent = 3
-};
-
-static Vp9oCudaSyncMode ReadCudaSyncModeFromEnv() noexcept
-{
-	wchar_t value[32] = {};
-	const DWORD len = GetEnvironmentVariableW(
-		L"WEBMIERE_CUDA_SYNC_MODE",
-		value,
-		static_cast<DWORD>(sizeof(value) / sizeof(value[0])));
-	if (len == 0)
-	{
-		return kVp9oCudaSyncEvent;
-	}
-	if (lstrcmpiW(value, L"context") == 0 ||
-		lstrcmpiW(value, L"ctx") == 0)
-	{
-		return kVp9oCudaSyncContext;
-	}
-	if (lstrcmpiW(value, L"producer") == 0 ||
-		lstrcmpiW(value, L"producer_stream") == 0)
-	{
-		return kVp9oCudaSyncProducer;
-	}
-	if (lstrcmpiW(value, L"same") == 0 ||
-		lstrcmpiW(value, L"same_stream") == 0 ||
-		lstrcmpiW(value, L"samestream") == 0)
-	{
-		return kVp9oCudaSyncSameStream;
-	}
-	if (lstrcmpiW(value, L"event") == 0 ||
-		lstrcmpiW(value, L"cuda_event") == 0)
-	{
-		return kVp9oCudaSyncEvent;
-	}
-	return kVp9oCudaSyncEvent;
-}
-
-#endif
+constexpr char kVp9oNv12ScaleShader[] =
+	"cbuffer Dimensions : register(b0) {"
+	" uint Width; uint Height; uint ChromaWidth; uint ChromaHeight;"
+	"};"
+	"Texture2D<float> InputY : register(t0);"
+	"Texture2D<float2> InputUV : register(t1);"
+	"SamplerState LinearClamp : register(s0);"
+	"RWTexture2D<float> OutputY : register(u0);"
+	"RWTexture2D<float> OutputU : register(u1);"
+	"RWTexture2D<float> OutputV : register(u2);"
+	"[numthreads(16, 16, 1)]"
+	"void main(uint3 id : SV_DispatchThreadID) {"
+	" if (id.x < Width && id.y < Height) {"
+	"  float2 uv = (float2(id.xy) + 0.5) / float2(Width, Height);"
+	"  OutputY[id.xy] = InputY.SampleLevel(LinearClamp, uv, 0);"
+	" }"
+	" if (id.x < ChromaWidth && id.y < ChromaHeight) {"
+	"  float2 uvPos = (float2(id.xy) + 0.5) / float2(ChromaWidth, ChromaHeight);"
+	"  float2 uv = InputUV.SampleLevel(LinearClamp, uvPos, 0);"
+	"  OutputU[id.xy] = uv.x;"
+	"  OutputV[id.xy] = uv.y;"
+	" }"
+	"}";
 }
 
 
@@ -179,19 +174,27 @@ static enum AVPixelFormat Vp9oGetFormat(AVCodecContext *ctx, const enum AVPixelF
 
 	for (const enum AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; ++p)
 	{
-		if (*p == AV_PIX_FMT_CUDA)
+		if (*p == AV_PIX_FMT_D3D11)
 		{
 			if (self)
 			{
 				self->OnHwFormatAccepted();
 			}
-			return AV_PIX_FMT_CUDA;
+			return AV_PIX_FMT_D3D11;
 		}
 	}
 
 	if (self)
 	{
 		self->OnHwFormatRejected();
+	}
+	for (const enum AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; ++p)
+	{
+		const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(*p);
+		if (desc != nullptr && (desc->flags & AV_PIX_FMT_FLAG_HWACCEL) == 0)
+		{
+			return *p;
+		}
 	}
 	return fmts[0];
 }
@@ -202,6 +205,28 @@ static bool IsHwPixFmt(int fmt)
 {
 	const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(fmt));
 	return (d != nullptr) && ((d->flags & AV_PIX_FMT_FLAG_HWACCEL) != 0);
+}
+
+
+static bool CodecSupportsD3D11(const AVCodec *codec)
+{
+	if (codec == nullptr)
+	{
+		return false;
+	}
+	for (int i = 0; ; i++)
+	{
+		const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i);
+		if (config == nullptr)
+		{
+			return false;
+		}
+		if (config->device_type == AV_HWDEVICE_TYPE_D3D11VA &&
+			(config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0)
+		{
+			return true;
+		}
+	}
 }
 
 
@@ -260,13 +285,9 @@ static bool ValidateDecodedFrameForView(const AVFrame *f)
 		return false;
 	}
 
-	if (f->format == AV_PIX_FMT_CUDA)
+	if (f->format == AV_PIX_FMT_D3D11)
 	{
-#if VP9O_ENABLE_NPP
 		return f->hw_frames_ctx != nullptr && f->data[0] != nullptr;
-#else
-		return false;
-#endif
 	}
 
 	const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(f->format));
@@ -305,29 +326,34 @@ static bool ValidateNV12Frame(const AVFrame *f)
 		   RowBytesCanHold(f->linesize[1], f->width);
 }
 
-#if VP9O_ENABLE_NPP
-static bool ValidateCudaNV12Frame(const AVFrame *f,
-								  AVHWFramesContext **outFramesCtx,
-								  AVCUDADeviceContext **outCudaDev)
+static bool ValidateD3D11NV12Frame(const AVFrame *f,
+								   AVHWFramesContext **outFramesCtx,
+								   AVD3D11VADeviceContext **outD3D11Dev,
+								   ID3D11Texture2D **outTexture,
+								   UINT *outArraySlice)
 {
 	if (outFramesCtx != nullptr)
 	{
 		*outFramesCtx = nullptr;
 	}
-	if (outCudaDev != nullptr)
+	if (outD3D11Dev != nullptr)
 	{
-		*outCudaDev = nullptr;
+		*outD3D11Dev = nullptr;
+	}
+	if (outTexture != nullptr)
+	{
+		*outTexture = nullptr;
+	}
+	if (outArraySlice != nullptr)
+	{
+		*outArraySlice = 0;
 	}
 
 	if (f == nullptr ||
-		f->format != AV_PIX_FMT_CUDA ||
+		f->format != AV_PIX_FMT_D3D11 ||
 		!Vp9oIsValidYuv420Size(f->width, f->height) ||
 		f->data[0] == nullptr ||
-		f->data[1] == nullptr ||
-		f->hw_frames_ctx == nullptr ||
-		f->linesize[0] <= 0 ||
-		f->linesize[1] <= 0 ||
-		f->linesize[0] != f->linesize[1])
+		f->hw_frames_ctx == nullptr)
 	{
 		return false;
 	}
@@ -341,8 +367,27 @@ static bool ValidateCudaNV12Frame(const AVFrame *f,
 		return false;
 	}
 
-	AVCUDADeviceContext *cudev = static_cast<AVCUDADeviceContext*>(fctx->device_ctx->hwctx);
-	if (cudev == nullptr || cudev->cuda_ctx == nullptr)
+	AVD3D11VADeviceContext *d3ddev =
+		static_cast<AVD3D11VADeviceContext*>(fctx->device_ctx->hwctx);
+	ID3D11Texture2D *texture = reinterpret_cast<ID3D11Texture2D*>(f->data[0]);
+	if (d3ddev == nullptr || d3ddev->device == nullptr ||
+		d3ddev->device_context == nullptr || d3ddev->video_device == nullptr ||
+		d3ddev->video_context == nullptr || texture == nullptr)
+	{
+		return false;
+	}
+	const intptr_t rawIndex = reinterpret_cast<intptr_t>(f->data[1]);
+	if (rawIndex < 0 || rawIndex > static_cast<intptr_t>(std::numeric_limits<UINT>::max()))
+	{
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC textureDesc = {};
+	texture->GetDesc(&textureDesc);
+	const UINT arraySlice = static_cast<UINT>(rawIndex);
+	if (textureDesc.Format != DXGI_FORMAT_NV12 ||
+		arraySlice >= textureDesc.ArraySize ||
+		static_cast<UINT>(f->width) > textureDesc.Width ||
+		static_cast<UINT>(f->height) > textureDesc.Height)
 	{
 		return false;
 	}
@@ -351,13 +396,20 @@ static bool ValidateCudaNV12Frame(const AVFrame *f,
 	{
 		*outFramesCtx = fctx;
 	}
-	if (outCudaDev != nullptr)
+	if (outD3D11Dev != nullptr)
 	{
-		*outCudaDev = cudev;
+		*outD3D11Dev = d3ddev;
+	}
+	if (outTexture != nullptr)
+	{
+		*outTexture = texture;
+	}
+	if (outArraySlice != nullptr)
+	{
+		*outArraySlice = arraySlice;
 	}
 	return true;
 }
-#endif
 
 
 VideoDecoder::VideoDecoder()
@@ -400,47 +452,7 @@ VideoDecoder::VideoDecoder()
 	, mSwsYuvSrcH(0)
 	, mSwsYuvDstW(0)
 	, mSwsYuvDstH(0)
-	, mCudaBgr(nullptr)
-	, mCudaBgra(nullptr)
-	, mCudaFlip(nullptr)
-	, mCudaBgrPitch(0)
-	, mCudaBgraPitch(0)
-	, mCudaFlipPitch(0)
-	, mCudaBufW(0)
-	, mCudaBufH(0)
-	, mCudaYuvY(nullptr)
-	, mCudaYuvU(nullptr)
-	, mCudaYuvV(nullptr)
-	, mCudaYuvYPitch(0)
-	, mCudaYuvUPitch(0)
-	, mCudaYuvVPitch(0)
-	, mCudaYuvBufW(0)
-	, mCudaYuvBufH(0)
-	, mCudaCtx(nullptr)
-	, mCudaStream(nullptr)
-	, mCudaCleanupFailed(false)
-	, mNppDevReady(false)
-	, mNppDeviceId(0)
-	, mNppMpCount(0)
-	, mNppMaxThreadsPerMp(0)
-	, mNppMaxThreadsPerBlock(0)
-	, mNppSharedMemPerBlock(0)
-	, mNppCcMajor(0)
-	, mNppCcMinor(0)
-	, mNppStreamFlags(0)
-	, mNppStreamCtx(nullptr)
-	, mNppStream(nullptr)
-	, mCudaSyncMode(
-#if VP9O_ENABLE_NPP
-		static_cast<int>(ReadCudaSyncModeFromEnv())
-#else
-		0
-#endif
-	  )
-	, mCudaProducerEvent(nullptr)
-	, mCudaProducerEventCtx(nullptr)
-	, mPinnedStaging(nullptr)
-	, mPinnedCapacity(0)
+	, mD3D11State(nullptr)
 	, mOpened(false)
 {
 }
@@ -453,32 +465,7 @@ VideoDecoder::~VideoDecoder()
 
 void VideoDecoder::Close()
 {
-	bool cudaReleaseOk = ReleaseCudaBuffers();
-
-#if VP9O_ENABLE_NPP
-	if (mPinnedStaging != nullptr)
-	{
-		if (cudaFreeHost(mPinnedStaging) == cudaSuccess)
-		{
-			mPinnedStaging  = nullptr;
-			mPinnedCapacity = 0;
-		}
-		else
-		{
-			cudaReleaseOk = false;
-		}
-	}
-	if (mNppStreamCtx != nullptr)
-	{
-		delete static_cast<NppStreamContext*>(mNppStreamCtx);
-		mNppStreamCtx = nullptr;
-	}
-	mNppStream = nullptr;
-#endif
-	if (!cudaReleaseOk)
-	{
-		MarkCudaCleanupFailed();
-	}
+	ReleaseD3D11Resources();
 
 	if (mSws)
 	{
@@ -540,9 +527,6 @@ void VideoDecoder::Close()
 bool VideoDecoder::Open(const prUTF16Char *path)
 {
 	mPathUtf8 = Utf16ToUtf8(path);
-#if VP9O_ENABLE_NPP
-	mCudaSyncMode = static_cast<int>(ReadCudaSyncModeFromEnv());
-#endif
 	wchar_t forceCpu[8] = {};
 	if (GetEnvironmentVariableW(L"WEBMIERE_FORCE_CPU_DECODE", forceCpu, static_cast<DWORD>(sizeof(forceCpu) / sizeof(forceCpu[0]))) > 0 &&
 		forceCpu[0] == L'1')
@@ -645,11 +629,16 @@ bool VideoDecoder::OpenInternal(bool allowHw)
 
 
 	AVBufferRefGuard hwGuard;
-	bool wantHw = allowHw && !mDisableHw && !mCudaCleanupFailed;
+	const AVCodec *hardwareDec = defaultDec;
+	if (isAv1)
+	{
+		hardwareDec = avcodec_find_decoder_by_name("av1");
+	}
+	bool wantHw = allowHw && !mDisableHw && CodecSupportsD3D11(hardwareDec);
 	if (wantHw)
 	{
 		AVBufferRef *hwRaw = nullptr;
-		int hr = av_hwdevice_ctx_create(&hwRaw, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
+		int hr = av_hwdevice_ctx_create(&hwRaw, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0);
 		if (hr < 0)
 		{
 			wantHw = false;
@@ -663,10 +652,18 @@ bool VideoDecoder::OpenInternal(bool allowHw)
 
 	auto tryOpenCodec = [&](bool useHw) -> bool
 	{
-		const AVCodec *attemptDec = defaultDec;
+		const AVCodec *attemptDec = useHw ? hardwareDec : defaultDec;
 		if (isAv1)
 		{
-			attemptDec = avcodec_find_decoder_by_name(useHw ? "av1" : "libdav1d");
+			attemptDec = useHw ? hardwareDec : avcodec_find_decoder_by_name("libdav1d");
+			if (!useHw && attemptDec == nullptr)
+			{
+				attemptDec = avcodec_find_decoder_by_name("libaom-av1");
+			}
+			if (!useHw && attemptDec == nullptr)
+			{
+				attemptDec = defaultDec;
+			}
 			if (attemptDec == nullptr)
 			{
 				return false;
@@ -877,6 +874,10 @@ bool VideoDecoder::DecodeNext()
 		}
 		if (ret != AVERROR(EAGAIN))
 		{
+			if (mUseHw)
+			{
+				mFallbackReason = "hw-decode-receive";
+			}
 			return false;
 		}
 
@@ -887,6 +888,14 @@ bool VideoDecoder::DecodeNext()
 			{
 				av_packet_unref(mPendingPacket);
 				mHasPendingPacket = false;
+				if (sret < 0)
+				{
+					if (mUseHw)
+					{
+						mFallbackReason = "hw-decode-send";
+					}
+					return false;
+				}
 			}
 			continue;
 		}
@@ -907,6 +916,10 @@ bool VideoDecoder::DecodeNext()
 			}
 			else if (sret != AVERROR(EAGAIN))
 			{
+				if (mUseHw)
+				{
+					mFallbackReason = "hw-decode-flush";
+				}
 				return false;
 			}
 			continue;
@@ -924,6 +937,15 @@ bool VideoDecoder::DecodeNext()
 				av_packet_move_ref(mPendingPacket, mPacket);
 				mHasPendingPacket = true;
 				continue;
+			}
+			if (sret < 0)
+			{
+				av_packet_unref(mPacket);
+				if (mUseHw)
+				{
+					mFallbackReason = "hw-decode-send";
+				}
+				return false;
 			}
 		}
 		av_packet_unref(mPacket);
@@ -1039,7 +1061,7 @@ bool VideoDecoder::DecodeFrameToSurface(int64_t targetFrame, Vp9oDecodedFrameVie
 	outView->width         = mFrame->width;
 	outView->height        = mFrame->height;
 	outView->avPixelFormat = mFrame->format;
-	outView->isCuda        = (mFrame->format == AV_PIX_FMT_CUDA);
+	outView->isD3D11       = (mFrame->format == AV_PIX_FMT_D3D11);
 	for (int i = 0; i < 4; i++)
 	{
 		outView->data[i]     = mFrame->data[i];
@@ -1058,11 +1080,11 @@ bool VideoDecoder::ConvertSurfaceToBGRA(const Vp9oDecodedFrameView &view, uint8_
 		return false;
 	}
 
-	if (view.isCuda)
+	if (view.isD3D11)
 	{
-		if (mCudaCleanupFailed || mDisableHw)
+		if (mDisableHw)
 		{
-			mFallbackReason = "cuda-cleanup";
+			mFallbackReason = "d3d11-disabled";
 			return false;
 		}
 
@@ -1073,7 +1095,7 @@ bool VideoDecoder::ConvertSurfaceToBGRA(const Vp9oDecodedFrameView &view, uint8_
 		}
 
 
-		if (ConvertToBGRA_CUDA(src, dst, dstRowBytes, dstW, dstH))
+		if (ConvertToBGRA_D3D11(src, dst, dstRowBytes, dstW, dstH))
 		{
 			return true;
 		}
@@ -1168,23 +1190,21 @@ bool VideoDecoder::ConvertSurfaceToYUV420P(const Vp9oDecodedFrameView &view,
 	}
 
 
-#if VP9O_ENABLE_CUDA_YUV420P_DIRECT
-	if (view.isCuda)
+	if (view.isD3D11)
 	{
-				if (ConvertCudaNV12ToYUV420P(view, dstY, dstYRowBytes, dstU, dstURowBytes,
+		if (ConvertD3D11NV12ToYUV420P(view, dstY, dstYRowBytes, dstU, dstURowBytes,
 									 dstV, dstVRowBytes, dstW, dstH))
 		{
-						return true;
+			return true;
 		}
-			}
-#endif
+	}
 
 
-	if (view.isCuda)
+	if (view.isD3D11)
 	{
-		if (mCudaCleanupFailed || mDisableHw)
+		if (mDisableHw)
 		{
-			mFallbackReason = "cuda-cleanup";
+			mFallbackReason = "d3d11-disabled";
 			return false;
 		}
 		av_frame_unref(mSwFrame);
@@ -1347,839 +1367,588 @@ bool VideoDecoder::ConvertToBGRA(const AVFrame *f, uint8_t *dst, int dstRowBytes
 }
 
 
-bool VideoDecoder::BuildNppStreamContext(void *streamVoid) noexcept
+
+
+static void ResetBgraResources(Vp9oD3D11State *state)
 {
-#if VP9O_ENABLE_NPP
-	if (mNppStreamCtx == nullptr)
+	if (state == nullptr)
 	{
-		mNppStreamCtx = new (std::nothrow) NppStreamContext();
-		if (mNppStreamCtx == nullptr)
-		{
-			return false;
-		}
+		return;
 	}
-	NppStreamContext *c = static_cast<NppStreamContext*>(mNppStreamCtx);
-	std::memset(c, 0, sizeof(*c));
-	c->hStream                            = reinterpret_cast<cudaStream_t>(streamVoid);
-	c->nCudaDeviceId                      = mNppDeviceId;
-	c->nMultiProcessorCount               = mNppMpCount;
-	c->nMaxThreadsPerMultiProcessor       = mNppMaxThreadsPerMp;
-	c->nMaxThreadsPerBlock                = mNppMaxThreadsPerBlock;
-	c->nSharedMemPerBlock                 = mNppSharedMemPerBlock;
-	c->nCudaDevAttrComputeCapabilityMajor = mNppCcMajor;
-	c->nCudaDevAttrComputeCapabilityMinor = mNppCcMinor;
-	c->nStreamFlags                       = mNppStreamFlags;
-	return true;
-#else
-	(void)streamVoid;
-	return false;
-#endif
+	state->bgraEnumerator.Reset();
+	state->bgraProcessor.Reset();
+	state->bgraTexture.Reset();
+	state->bgraOutputView.Reset();
+	state->bgraStaging.Reset();
+	state->bgraSrcW = state->bgraSrcH = state->bgraDstW = state->bgraDstH = 0;
 }
 
 
-bool VideoDecoder::EnsureCudaConsumerStream(void **outStream) noexcept
+static void ResetYuvResources(Vp9oD3D11State *state)
 {
-#if VP9O_ENABLE_NPP
-	if (outStream == nullptr)
+	if (state == nullptr)
+	{
+		return;
+	}
+	state->yuvShader.Reset();
+	state->yuvConstants.Reset();
+	state->yuvSampler.Reset();
+	state->nv12Texture.Reset();
+	state->nv12YView.Reset();
+	state->nv12UVView.Reset();
+	state->yTexture.Reset();
+	state->uTexture.Reset();
+	state->vTexture.Reset();
+	state->yUav.Reset();
+	state->uUav.Reset();
+	state->vUav.Reset();
+	state->yStaging.Reset();
+	state->uStaging.Reset();
+	state->vStaging.Reset();
+	state->yuvSrcW = state->yuvSrcH = state->yuvDstW = state->yuvDstH = 0;
+}
+
+
+static bool InitializeD3D11State(
+	Vp9oD3D11State **statePtr,
+	AVD3D11VADeviceContext *deviceContext)
+{
+	if (statePtr == nullptr || deviceContext == nullptr ||
+		deviceContext->device == nullptr || deviceContext->device_context == nullptr ||
+		deviceContext->video_device == nullptr || deviceContext->video_context == nullptr)
 	{
 		return false;
 	}
-	if (mCudaStream == nullptr)
-	{
-		cudaStream_t s = nullptr;
-		if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess)
-		{
-			return false;
-		}
-		mCudaStream = reinterpret_cast<void*>(s);
-	}
-	*outStream = mCudaStream;
-	return true;
-#else
-	(void)outStream;
-	return false;
-#endif
-}
 
-
-bool VideoDecoder::EnsureNppStreamContext(void *streamVoid) noexcept
-{
-#if VP9O_ENABLE_NPP
-	if (mNppDevReady && mNppStream == streamVoid && mNppStreamCtx != nullptr)
+	Vp9oD3D11State *state = *statePtr;
+	if (state != nullptr && state->device.Get() == deviceContext->device)
 	{
 		return true;
 	}
 
-	int dev = 0;
-	if (cudaGetDevice(&dev) != cudaSuccess)
+	delete state;
+	state = new (std::nothrow) Vp9oD3D11State();
+	if (state == nullptr)
 	{
+		*statePtr = nullptr;
 		return false;
 	}
-	cudaDeviceProp prop;
-	if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess)
+	state->device = deviceContext->device;
+	state->context = deviceContext->device_context;
+	state->videoDevice = deviceContext->video_device;
+	state->videoContext = deviceContext->video_context;
+	if (FAILED(state->device.As(&state->device3)))
 	{
+		delete state;
+		*statePtr = nullptr;
 		return false;
 	}
-	unsigned int sflags = 0;
-	cudaStream_t stream = reinterpret_cast<cudaStream_t>(streamVoid);
-	if (stream != nullptr && cudaStreamGetFlags(stream, &sflags) != cudaSuccess)
-	{
-		return false;
-	}
-
-	mNppDeviceId           = dev;
-	mNppMpCount            = prop.multiProcessorCount;
-	mNppMaxThreadsPerMp    = prop.maxThreadsPerMultiProcessor;
-	mNppMaxThreadsPerBlock = prop.maxThreadsPerBlock;
-	mNppSharedMemPerBlock  = prop.sharedMemPerBlock;
-	mNppCcMajor            = prop.major;
-	mNppCcMinor            = prop.minor;
-	mNppStreamFlags        = sflags;
-	if (!BuildNppStreamContext(streamVoid))
-	{
-		return false;
-	}
-	mNppDevReady = true;
-	mNppStream   = streamVoid;
+	state->videoContext.As(&state->videoContext1);
+	*statePtr = state;
 	return true;
-#else
-	(void)streamVoid;
-	return false;
-#endif
 }
 
 
-bool VideoDecoder::DestroyCudaEventStrict() noexcept
+static bool EnsureBgraResources(
+	Vp9oD3D11State *state,
+	int srcW,
+	int srcH,
+	int dstW,
+	int dstH)
 {
-#if VP9O_ENABLE_NPP
-	bool eventOk = true;
-	if (mCudaProducerEvent != nullptr)
-	{
-		CUevent ev = reinterpret_cast<CUevent>(mCudaProducerEvent);
-		if (cuEventDestroy(ev) == CUDA_SUCCESS)
-		{
-			mCudaProducerEvent = nullptr;
-			mCudaProducerEventCtx = nullptr;
-		}
-		else
-		{
-			eventOk = false;
-		}
-	}
-	return eventOk;
-#else
-	mCudaProducerEvent = nullptr;
-	mCudaProducerEventCtx = nullptr;
-	return true;
-#endif
-}
-
-
-bool VideoDecoder::PrepareCudaSurfaceRead(AVCUDADeviceContext *cudaDev,
-										  void **outStream,
-										  bool *outQueuedWait) noexcept
-{
-#if VP9O_ENABLE_NPP
-	if (outStream == nullptr || cudaDev == nullptr || cudaDev->cuda_ctx == nullptr)
+	if (state == nullptr || state->device == nullptr || state->videoDevice == nullptr ||
+		!Vp9oIsValidVideoSize(srcW, srcH) || !Vp9oIsValidVideoSize(dstW, dstH))
 	{
 		return false;
 	}
-	if (outQueuedWait != nullptr)
-	{
-		*outQueuedWait = false;
-	}
-
-	CUstream producerStream = cudaDev->stream;
-	Vp9oCudaSyncMode mode = static_cast<Vp9oCudaSyncMode>(mCudaSyncMode);
-
-	void *consumerStream = nullptr;
-	if (mode == kVp9oCudaSyncSameStream)
-	{
-		consumerStream = reinterpret_cast<void*>(producerStream);
-		if (!EnsureNppStreamContext(consumerStream))
-		{
-			mode = kVp9oCudaSyncProducer;
-		}
-		else
-		{
-			*outStream = consumerStream;
-			return true;
-		}
-	}
-
-	if (!EnsureCudaConsumerStream(&consumerStream))
-	{
-		return false;
-	}
-	if (!EnsureNppStreamContext(consumerStream))
-	{
-		return false;
-	}
-
-	CUstream consumerCuStream = reinterpret_cast<CUstream>(consumerStream);
-
-	if (mode == kVp9oCudaSyncEvent)
-	{
-		if (mCudaProducerEventCtx != reinterpret_cast<void*>(cudaDev->cuda_ctx))
-		{
-			if (!DestroyCudaEventStrict())
-			{
-				return false;
-			}
-			mCudaProducerEventCtx = reinterpret_cast<void*>(cudaDev->cuda_ctx);
-		}
-		if (mCudaProducerEvent == nullptr)
-		{
-			CUevent ev = nullptr;
-			if (cuEventCreate(&ev, CU_EVENT_DISABLE_TIMING) == CUDA_SUCCESS)
-			{
-				mCudaProducerEvent = reinterpret_cast<void*>(ev);
-			}
-		}
-		if (mCudaProducerEvent != nullptr)
-		{
-			CUevent ev = reinterpret_cast<CUevent>(mCudaProducerEvent);
-			if (cuEventRecord(ev, producerStream) == CUDA_SUCCESS &&
-				cuStreamWaitEvent(consumerCuStream, ev, 0) == CUDA_SUCCESS)
-			{
-				if (outQueuedWait != nullptr)
-				{
-					*outQueuedWait = true;
-				}
-				*outStream = consumerStream;
-				return true;
-			}
-		}
-
-		mode = kVp9oCudaSyncProducer;
-	}
-
-	if (mode == kVp9oCudaSyncProducer)
-	{
-		if (cuStreamSynchronize(producerStream) == CUDA_SUCCESS)
-		{
-			*outStream = consumerStream;
-			return true;
-		}
-		mode = kVp9oCudaSyncContext;
-	}
-
-	if (mode == kVp9oCudaSyncContext)
-	{
-		if (cuCtxSynchronize() == CUDA_SUCCESS)
-		{
-			*outStream = consumerStream;
-			return true;
-		}
-	}
-
-	return false;
-#else
-	(void)cudaDev;
-	(void)outStream;
-	(void)outQueuedWait;
-	return false;
-#endif
-}
-
-
-bool VideoDecoder::EnsurePinned(size_t bytes)
-{
-#if VP9O_ENABLE_NPP
-	if (mCudaCleanupFailed)
-	{
-		return false;
-	}
-	if (mPinnedStaging != nullptr && mPinnedCapacity >= bytes)
+	if (state->bgraEnumerator != nullptr &&
+		state->bgraSrcW == srcW && state->bgraSrcH == srcH &&
+		state->bgraDstW == dstW && state->bgraDstH == dstH)
 	{
 		return true;
 	}
-	if (mPinnedStaging != nullptr)
-	{
-		if (cudaFreeHost(mPinnedStaging) != cudaSuccess)
-		{
-			MarkCudaCleanupFailed();
-			return false;
-		}
-		mPinnedStaging  = nullptr;
-		mPinnedCapacity = 0;
-	}
-	void *p = nullptr;
-	if (cudaHostAlloc(&p, bytes, cudaHostAllocDefault) != cudaSuccess)
+
+	ResetBgraResources(state);
+	D3D11_VIDEO_PROCESSOR_CONTENT_DESC contentDesc = {};
+	contentDesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+	contentDesc.InputFrameRate.Numerator = 60;
+	contentDesc.InputFrameRate.Denominator = 1;
+	contentDesc.InputWidth = static_cast<UINT>(srcW);
+	contentDesc.InputHeight = static_cast<UINT>(srcH);
+	contentDesc.OutputFrameRate.Numerator = 60;
+	contentDesc.OutputFrameRate.Denominator = 1;
+	contentDesc.OutputWidth = static_cast<UINT>(dstW);
+	contentDesc.OutputHeight = static_cast<UINT>(dstH);
+	contentDesc.Usage = D3D11_VIDEO_USAGE_OPTIMAL_QUALITY;
+	if (FAILED(state->videoDevice->CreateVideoProcessorEnumerator(
+			&contentDesc, &state->bgraEnumerator)))
 	{
 		return false;
 	}
-	mPinnedStaging  = static_cast<uint8_t*>(p);
-	mPinnedCapacity = bytes;
+
+	UINT inputSupport = 0;
+	UINT outputSupport = 0;
+	if (FAILED(state->bgraEnumerator->CheckVideoProcessorFormat(
+			DXGI_FORMAT_NV12, &inputSupport)) ||
+		FAILED(state->bgraEnumerator->CheckVideoProcessorFormat(
+			DXGI_FORMAT_B8G8R8A8_UNORM, &outputSupport)) ||
+		(inputSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) == 0 ||
+		(outputSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) == 0 ||
+		FAILED(state->videoDevice->CreateVideoProcessor(
+			state->bgraEnumerator.Get(), 0, &state->bgraProcessor)))
+	{
+		ResetBgraResources(state);
+		return false;
+	}
+
+	D3D11_TEXTURE2D_DESC outputDesc = {};
+	outputDesc.Width = static_cast<UINT>(dstW);
+	outputDesc.Height = static_cast<UINT>(dstH);
+	outputDesc.MipLevels = 1;
+	outputDesc.ArraySize = 1;
+	outputDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+	outputDesc.SampleDesc.Count = 1;
+	outputDesc.Usage = D3D11_USAGE_DEFAULT;
+	outputDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+	if (FAILED(state->device->CreateTexture2D(
+			&outputDesc, nullptr, &state->bgraTexture)))
+	{
+		ResetBgraResources(state);
+		return false;
+	}
+
+	D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputViewDesc = {};
+	outputViewDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+	if (FAILED(state->videoDevice->CreateVideoProcessorOutputView(
+			state->bgraTexture.Get(), state->bgraEnumerator.Get(),
+			&outputViewDesc, &state->bgraOutputView)))
+	{
+		ResetBgraResources(state);
+		return false;
+	}
+
+	outputDesc.Usage = D3D11_USAGE_STAGING;
+	outputDesc.BindFlags = 0;
+	outputDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	if (FAILED(state->device->CreateTexture2D(
+			&outputDesc, nullptr, &state->bgraStaging)))
+	{
+		ResetBgraResources(state);
+		return false;
+	}
+	state->bgraSrcW = srcW;
+	state->bgraSrcH = srcH;
+	state->bgraDstW = dstW;
+	state->bgraDstH = dstH;
 	return true;
-#else
-	(void)bytes;
-	return false;
-#endif
 }
 
 
-bool VideoDecoder::ConvertToBGRA_CUDA(const AVFrame *f, uint8_t *dst, int dstRowBytes, int dstW, int dstH)
+static bool CreatePlaneResources(
+	Vp9oD3D11State *state,
+	UINT width,
+	UINT height,
+	ComPtr<ID3D11Texture2D> *texture,
+	ComPtr<ID3D11UnorderedAccessView> *uav,
+	ComPtr<ID3D11Texture2D> *staging)
 {
-#if VP9O_ENABLE_NPP
-	if (mCudaCleanupFailed || mDisableHw)
-	{
-		mFallbackReason = "cuda-cleanup";
-		return false;
-	}
-	if (f == nullptr || dst == nullptr)
-	{
-		return false;
-	}
-
-	if (!Vp9oIsValidVideoSize(dstW, dstH) ||
-		f->width != dstW || f->height != dstH)
-	{
-		return false;
-	}
-	if (dstW > std::numeric_limits<int>::max() / 4)
+	D3D11_TEXTURE2D_DESC desc = {};
+	desc.Width = width;
+	desc.Height = height;
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.Format = DXGI_FORMAT_R8_UNORM;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+	if (FAILED(state->device->CreateTexture2D(
+			&desc, nullptr, texture->ReleaseAndGetAddressOf())) ||
+		FAILED(state->device->CreateUnorderedAccessView(
+			texture->Get(), nullptr, uav->ReleaseAndGetAddressOf())))
 	{
 		return false;
 	}
-	const int bgraStride = dstW * 4;
-	if (!RowBytesCanHold(dstRowBytes, bgraStride))
-	{
-		return false;
-	}
-
-	AVHWFramesContext    *fctx  = nullptr;
-	AVCUDADeviceContext  *cudev = nullptr;
-	if (!ValidateCudaNV12Frame(f, &fctx, &cudev))
-	{
-		return false;
-	}
-	(void)fctx;
-	CUcontext cuCtx = cudev->cuda_ctx;
-
-	if (mCudaCtx != nullptr && mCudaCtx != reinterpret_cast<void*>(cuCtx))
-	{
-				if (!ReleaseCudaBuffersInCtx(mCudaCtx))
-		{
-			MarkCudaCleanupFailed();
-						return false;
-		}
-	}
-
-	CuCtxPushGuard ctxGuard(cuCtx);
-	if (!ctxGuard.ok())
-	{
-				return false;
-	}
-	mCudaCtx = reinterpret_cast<void*>(cuCtx);
-
-	bool			ok    = false;
-	do
-	{
-		if (mCudaBgr == nullptr || mCudaBgra == nullptr || mCudaFlip == nullptr ||
-			mCudaBufW != dstW || mCudaBufH != dstH)
-		{
-
-
-			if (!FreeCudaBuffersStrict())
-			{
-				MarkCudaCleanupFailed();
-								break;
-			}
-
-			void *p0 = nullptr, *p1 = nullptr, *p2 = nullptr;
-			if (cudaMallocPitch(&p0, &mCudaBgrPitch,  static_cast<size_t>(dstW) * 3, static_cast<size_t>(dstH)) != cudaSuccess) { break; }
-			mCudaBgr = static_cast<uint8_t*>(p0);
-			if (cudaMallocPitch(&p1, &mCudaBgraPitch, static_cast<size_t>(dstW) * 4, static_cast<size_t>(dstH)) != cudaSuccess) { break; }
-			mCudaBgra = static_cast<uint8_t*>(p1);
-			if (cudaMallocPitch(&p2, &mCudaFlipPitch, static_cast<size_t>(dstW) * 4, static_cast<size_t>(dstH)) != cudaSuccess) { break; }
-			mCudaFlip = static_cast<uint8_t*>(p2);
-
-			mCudaBufW = dstW;
-			mCudaBufH = dstH;
-					}
-
-		void *streamVoid = nullptr;
-		bool queuedWait = false;
-		if (!PrepareCudaSurfaceRead(cudev, &streamVoid, &queuedWait))
-		{
-			break;
-		}
-		(void)queuedWait;
-		cudaStream_t stream = reinterpret_cast<cudaStream_t>(streamVoid);
-
-		if (mNppStreamCtx == nullptr)
-		{
-			break;
-		}
-		NppStreamContext &nppCtx = *static_cast<NppStreamContext*>(mNppStreamCtx);
-
-		const NppiSize roi    = { dstW, dstH };
-		const Npp8u   *pSrc[2] = {
-			reinterpret_cast<const Npp8u*>(f->data[0]),
-			reinterpret_cast<const Npp8u*>(f->data[1])
-		};
-		const int srcStep = f->linesize[0];
-
-		if (nppiNV12ToBGR_709CSC_8u_P2C3R_Ctx(pSrc, srcStep, mCudaBgr, static_cast<int>(mCudaBgrPitch), roi, nppCtx) != NPP_SUCCESS)
-		{
-			break;
-		}
-
-		const int dstOrder[4] = { 0, 1, 2, 3 };
-		if (nppiSwapChannels_8u_C3C4R_Ctx(mCudaBgr, static_cast<int>(mCudaBgrPitch), mCudaBgra, static_cast<int>(mCudaBgraPitch), roi, dstOrder, 255, nppCtx) != NPP_SUCCESS)
-		{
-			break;
-		}
-
-		if (nppiMirror_8u_C4R_Ctx(mCudaBgra, static_cast<int>(mCudaBgraPitch), mCudaFlip, static_cast<int>(mCudaFlipPitch), roi, NPP_HORIZONTAL_AXIS, nppCtx) != NPP_SUCCESS)
-		{
-			break;
-		}
-
-
-		const bool canCopyDirect = dstRowBytes >= bgraStride;
-		if (canCopyDirect)
-		{
-			if (cudaMemcpy2DAsync(dst, static_cast<size_t>(dstRowBytes),
-							  mCudaFlip, mCudaFlipPitch,
-							  static_cast<size_t>(bgraStride), static_cast<size_t>(dstH),
-							  cudaMemcpyDeviceToHost, stream) != cudaSuccess)
-			{
-				break;
-			}
-			if (cudaStreamSynchronize(stream) != cudaSuccess)
-			{
-				break;
-			}
-		}
-		else
-		{
-			const size_t bgraBytes = static_cast<size_t>(bgraStride) * static_cast<size_t>(dstH);
-			if (!EnsurePinned(bgraBytes))
-			{
-				break;
-			}
-			if (cudaMemcpy2DAsync(mPinnedStaging, static_cast<size_t>(bgraStride),
-							  mCudaFlip, mCudaFlipPitch,
-							  static_cast<size_t>(bgraStride), static_cast<size_t>(dstH),
-							  cudaMemcpyDeviceToHost, stream) != cudaSuccess)
-			{
-				break;
-			}
-			if (cudaStreamSynchronize(stream) != cudaSuccess)
-			{
-				break;
-			}
-			CopyPlaneRespectingRowBytes(dst, dstRowBytes, mPinnedStaging, bgraStride, bgraStride, dstH);
-		}
-
-				ok = true;
-	}
-	while (false);
-
-
-	const bool		popOk  = ctxGuard.pop();
-	if (!popOk)
-	{
-		MarkCudaCleanupFailed();
-				ok = false;
-	}
-
-
-	if (!ok && popOk)
-	{
-		if (!ReleaseCudaBuffersInCtx(mCudaCtx))
-		{
-			MarkCudaCleanupFailed();
-		}
-	}
-
-	return ok;
-#else
-	(void)f; (void)dst; (void)dstRowBytes; (void)dstW; (void)dstH;
-	return false;
-#endif
+	desc.Usage = D3D11_USAGE_STAGING;
+	desc.BindFlags = 0;
+	desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	return SUCCEEDED(state->device->CreateTexture2D(
+		&desc, nullptr, staging->ReleaseAndGetAddressOf()));
 }
 
 
-bool VideoDecoder::ConvertCudaNV12ToYUV420P(const Vp9oDecodedFrameView &view,
-											uint8_t *dstY, int dstYRowBytes,
-											uint8_t *dstU, int dstURowBytes,
-											uint8_t *dstV, int dstVRowBytes,
-											int dstW, int dstH)
+static bool EnsureYuvResources(
+	Vp9oD3D11State *state,
+	int srcW,
+	int srcH,
+	int dstW,
+	int dstH)
 {
-#if VP9O_ENABLE_NPP
+	if (state == nullptr || state->device == nullptr || state->device3 == nullptr ||
+		!Vp9oIsValidYuv420Size(srcW, srcH) ||
+		!Vp9oIsValidYuv420Size(dstW, dstH))
+	{
+		return false;
+	}
+	if (state->nv12Texture != nullptr &&
+		state->yuvSrcW == srcW && state->yuvSrcH == srcH &&
+		state->yuvDstW == dstW && state->yuvDstH == dstH)
+	{
+		return true;
+	}
+
+	ResetYuvResources(state);
+	ComPtr<ID3DBlob> shaderBlob;
+	ComPtr<ID3DBlob> shaderErrors;
+	if (FAILED(D3DCompile(
+			kVp9oNv12ScaleShader, sizeof(kVp9oNv12ScaleShader) - 1,
+			"WebMiereNV12Scale", nullptr, nullptr, "main", "cs_5_0",
+			D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &shaderBlob, &shaderErrors)) ||
+		shaderBlob == nullptr ||
+		FAILED(state->device->CreateComputeShader(
+			shaderBlob->GetBufferPointer(), shaderBlob->GetBufferSize(),
+			nullptr, &state->yuvShader)))
+	{
+		ResetYuvResources(state);
+		return false;
+	}
+
+	D3D11_BUFFER_DESC constantDesc = {};
+	constantDesc.ByteWidth = 16;
+	constantDesc.Usage = D3D11_USAGE_DEFAULT;
+	constantDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	if (FAILED(state->device->CreateBuffer(
+			&constantDesc, nullptr, &state->yuvConstants)))
+	{
+		ResetYuvResources(state);
+		return false;
+	}
+	D3D11_SAMPLER_DESC samplerDesc = {};
+	samplerDesc.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+	samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+	samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+	samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+	samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+	if (FAILED(state->device->CreateSamplerState(
+			&samplerDesc, &state->yuvSampler)))
+	{
+		ResetYuvResources(state);
+		return false;
+	}
+
+	D3D11_TEXTURE2D_DESC nv12Desc = {};
+	nv12Desc.Width = static_cast<UINT>(srcW);
+	nv12Desc.Height = static_cast<UINT>(srcH);
+	nv12Desc.MipLevels = 1;
+	nv12Desc.ArraySize = 1;
+	nv12Desc.Format = DXGI_FORMAT_NV12;
+	nv12Desc.SampleDesc.Count = 1;
+	nv12Desc.Usage = D3D11_USAGE_DEFAULT;
+	nv12Desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	if (FAILED(state->device->CreateTexture2D(
+			&nv12Desc, nullptr, &state->nv12Texture)))
+	{
+		ResetYuvResources(state);
+		return false;
+	}
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC1 yViewDesc = {};
+	yViewDesc.Format = DXGI_FORMAT_R8_UNORM;
+	yViewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	yViewDesc.Texture2D.MipLevels = 1;
+	yViewDesc.Texture2D.PlaneSlice = 0;
+	if (FAILED(state->device3->CreateShaderResourceView1(
+			state->nv12Texture.Get(), &yViewDesc, &state->nv12YView)))
+	{
+		ResetYuvResources(state);
+		return false;
+	}
+	D3D11_SHADER_RESOURCE_VIEW_DESC1 uvViewDesc = yViewDesc;
+	uvViewDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+	uvViewDesc.Texture2D.PlaneSlice = 1;
+	if (FAILED(state->device3->CreateShaderResourceView1(
+			state->nv12Texture.Get(), &uvViewDesc, &state->nv12UVView)))
+	{
+		ResetYuvResources(state);
+		return false;
+	}
+
+	const UINT chromaW = static_cast<UINT>(dstW / 2);
+	const UINT chromaH = static_cast<UINT>(dstH / 2);
+	if (!CreatePlaneResources(state, static_cast<UINT>(dstW),
+			static_cast<UINT>(dstH), &state->yTexture, &state->yUav,
+			&state->yStaging) ||
+		!CreatePlaneResources(state, chromaW, chromaH, &state->uTexture,
+			&state->uUav, &state->uStaging) ||
+		!CreatePlaneResources(state, chromaW, chromaH, &state->vTexture,
+			&state->vUav, &state->vStaging))
+	{
+		ResetYuvResources(state);
+		return false;
+	}
+	state->yuvSrcW = srcW;
+	state->yuvSrcH = srcH;
+	state->yuvDstW = dstW;
+	state->yuvDstH = dstH;
+	return true;
+}
+
+
+static bool CopyMappedPlane(
+	ID3D11DeviceContext *context,
+	ID3D11Texture2D *staging,
+	uint8_t *dst,
+	int dstRowBytes,
+	int width,
+	int height)
+{
+	if (context == nullptr || staging == nullptr || dst == nullptr ||
+		!RowBytesCanHold(dstRowBytes, width))
+	{
+		return false;
+	}
+	D3D11_MAPPED_SUBRESOURCE mapped = {};
+	if (FAILED(context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped)))
+	{
+		return false;
+	}
+	CopyPlaneRespectingRowBytes(dst, dstRowBytes,
+		static_cast<const uint8_t*>(mapped.pData),
+		static_cast<int>(mapped.RowPitch), width, height);
+	context->Unmap(staging, 0);
+	return true;
+}
+
+
+bool VideoDecoder::ConvertToBGRA_D3D11(
+	const AVFrame *f,
+	uint8_t *dst,
+	int dstRowBytes,
+	int dstW,
+	int dstH)
+{
+	mFallbackReason = "d3d11-bgra";
+	if (f == nullptr || dst == nullptr ||
+		!Vp9oIsValidVideoSize(dstW, dstH) ||
+		dstW > std::numeric_limits<int>::max() / 4 ||
+		!RowBytesCanHold(dstRowBytes, dstW * 4))
+	{
+		return false;
+	}
+
+	AVHWFramesContext *framesContext = nullptr;
+	AVD3D11VADeviceContext *deviceContext = nullptr;
+	ID3D11Texture2D *sourceTexture = nullptr;
+	UINT arraySlice = 0;
+	if (!ValidateD3D11NV12Frame(f, &framesContext, &deviceContext,
+			&sourceTexture, &arraySlice))
+	{
+		return false;
+	}
+	(void)framesContext;
+
+	D3D11DeviceLockGuard lock(deviceContext);
+	if (!InitializeD3D11State(&mD3D11State, deviceContext) ||
+		!EnsureBgraResources(mD3D11State, f->width, f->height, dstW, dstH))
+	{
+		return false;
+	}
+
+	D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputViewDesc = {};
+	inputViewDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+	inputViewDesc.Texture2D.ArraySlice = arraySlice;
+	ComPtr<ID3D11VideoProcessorInputView> inputView;
+	if (FAILED(mD3D11State->videoDevice->CreateVideoProcessorInputView(
+			sourceTexture, mD3D11State->bgraEnumerator.Get(),
+			&inputViewDesc, &inputView)))
+	{
+		return false;
+	}
+
+	const RECT sourceRect = { 0, 0, f->width, f->height };
+	const RECT outputRect = { 0, 0, dstW, dstH };
+	mD3D11State->videoContext->VideoProcessorSetStreamSourceRect(
+		mD3D11State->bgraProcessor.Get(), 0, TRUE, &sourceRect);
+	mD3D11State->videoContext->VideoProcessorSetStreamDestRect(
+		mD3D11State->bgraProcessor.Get(), 0, TRUE, &outputRect);
+	mD3D11State->videoContext->VideoProcessorSetOutputTargetRect(
+		mD3D11State->bgraProcessor.Get(), TRUE, &outputRect);
+	mD3D11State->videoContext->VideoProcessorSetOutputAlphaFillMode(
+		mD3D11State->bgraProcessor.Get(),
+		D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE_OPAQUE, 0);
+
+	const bool fullRange = f->color_range == AVCOL_RANGE_JPEG;
+	if (mD3D11State->videoContext1 != nullptr)
+	{
+		mD3D11State->videoContext1->VideoProcessorSetStreamColorSpace1(
+			mD3D11State->bgraProcessor.Get(), 0,
+			fullRange ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709
+				: DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
+		mD3D11State->videoContext1->VideoProcessorSetOutputColorSpace1(
+			mD3D11State->bgraProcessor.Get(),
+			DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+	}
+	else
+	{
+		D3D11_VIDEO_PROCESSOR_COLOR_SPACE inputColor = {};
+		inputColor.Usage = 1;
+		inputColor.YCbCr_Matrix = 1;
+		inputColor.Nominal_Range = fullRange
+			? D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255
+			: D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+		D3D11_VIDEO_PROCESSOR_COLOR_SPACE outputColor = {};
+		outputColor.Usage = 1;
+		mD3D11State->videoContext->VideoProcessorSetStreamColorSpace(
+			mD3D11State->bgraProcessor.Get(), 0, &inputColor);
+		mD3D11State->videoContext->VideoProcessorSetOutputColorSpace(
+			mD3D11State->bgraProcessor.Get(), &outputColor);
+	}
+
+	D3D11_VIDEO_PROCESSOR_STREAM stream = {};
+	stream.Enable = TRUE;
+	stream.pInputSurface = inputView.Get();
+	if (FAILED(mD3D11State->videoContext->VideoProcessorBlt(
+			mD3D11State->bgraProcessor.Get(),
+			mD3D11State->bgraOutputView.Get(), 0, 1, &stream)))
+	{
+		return false;
+	}
+	mD3D11State->context->CopyResource(
+		mD3D11State->bgraStaging.Get(), mD3D11State->bgraTexture.Get());
+
+	D3D11_MAPPED_SUBRESOURCE mapped = {};
+	if (FAILED(mD3D11State->context->Map(
+			mD3D11State->bgraStaging.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
+	{
+		return false;
+	}
+	uint8_t *flippedDst = dst + static_cast<ptrdiff_t>(dstH - 1) * dstRowBytes;
+	CopyPlaneRespectingRowBytes(flippedDst, -dstRowBytes,
+		static_cast<const uint8_t*>(mapped.pData),
+		static_cast<int>(mapped.RowPitch), dstW * 4, dstH);
+	mD3D11State->context->Unmap(mD3D11State->bgraStaging.Get(), 0);
+	mFallbackReason = nullptr;
+	return true;
+}
+
+
+bool VideoDecoder::ConvertD3D11NV12ToYUV420P(
+	const Vp9oDecodedFrameView &view,
+	uint8_t *dstY,
+	int dstYRowBytes,
+	uint8_t *dstU,
+	int dstURowBytes,
+	uint8_t *dstV,
+	int dstVRowBytes,
+	int dstW,
+	int dstH)
+{
+	mFallbackReason = "d3d11-yuv420p";
 	const AVFrame *f = view.frame;
-
-	if (mCudaCleanupFailed || mDisableHw)
-	{
-		mFallbackReason = "cuda-cleanup";
-		return false;
-	}
-	if (f == nullptr || dstY == nullptr || dstU == nullptr || dstV == nullptr)
-	{
-		return false;
-	}
-	if (!Vp9oIsValidYuv420Size(dstW, dstH))
-	{
-		return false;
-	}
-	if (f->width != dstW || f->height != dstH)
-	{
-		return false;
-	}
-	if (f->color_range == AVCOL_RANGE_JPEG)
+	if (f == nullptr || dstY == nullptr || dstU == nullptr || dstV == nullptr ||
+		!Vp9oIsValidYuv420Size(dstW, dstH) ||
+		f->color_range == AVCOL_RANGE_JPEG ||
+		!RowBytesCanHold(dstYRowBytes, dstW) ||
+		!RowBytesCanHold(dstURowBytes, dstW / 2) ||
+		!RowBytesCanHold(dstVRowBytes, dstW / 2))
 	{
 		return false;
 	}
 
-
-	AVHWFramesContext    *fctx  = nullptr;
-	AVCUDADeviceContext  *cudev = nullptr;
-	if (!ValidateCudaNV12Frame(f, &fctx, &cudev))
+	AVHWFramesContext *framesContext = nullptr;
+	AVD3D11VADeviceContext *deviceContext = nullptr;
+	ID3D11Texture2D *sourceTexture = nullptr;
+	UINT arraySlice = 0;
+	if (!ValidateD3D11NV12Frame(f, &framesContext, &deviceContext,
+			&sourceTexture, &arraySlice))
 	{
 		return false;
 	}
-	(void)fctx;
-	CUcontext cuCtx = cudev->cuda_ctx;
+	(void)framesContext;
 
-
-	const int srcStep = f->linesize[0];
-
-	if (mCudaCtx != nullptr && mCudaCtx != reinterpret_cast<void*>(cuCtx))
+	D3D11DeviceLockGuard lock(deviceContext);
+	std::lock_guard<std::mutex> computeLock(gD3D11ComputeExecutionMutex);
+	if (!InitializeD3D11State(&mD3D11State, deviceContext) ||
+		!EnsureYuvResources(mD3D11State, f->width, f->height, dstW, dstH))
 	{
-				if (!ReleaseCudaBuffersInCtx(mCudaCtx))
-		{
-			MarkCudaCleanupFailed();
-						return false;
-		}
+		return false;
 	}
 
-	CuCtxPushGuard ctxGuard(cuCtx);
-	if (!ctxGuard.ok())
+	D3D11_TEXTURE2D_DESC sourceDesc = {};
+	sourceTexture->GetDesc(&sourceDesc);
+	const UINT sourceSubresource = D3D11CalcSubresource(
+		0, arraySlice, sourceDesc.MipLevels);
+	D3D11_BOX sourceBox = {};
+	sourceBox.right = static_cast<UINT>(f->width);
+	sourceBox.bottom = static_cast<UINT>(f->height);
+	sourceBox.back = 1;
+	mD3D11State->context->CopySubresourceRegion(
+		mD3D11State->nv12Texture.Get(), 0, 0, 0, 0,
+		sourceTexture, sourceSubresource, &sourceBox);
+
+	struct ShaderDimensions
 	{
-				return false;
-	}
-	mCudaCtx = reinterpret_cast<void*>(cuCtx);
+		UINT width;
+		UINT height;
+		UINT chromaWidth;
+		UINT chromaHeight;
+	};
+	const ShaderDimensions dimensions = {
+		static_cast<UINT>(dstW), static_cast<UINT>(dstH),
+		static_cast<UINT>(dstW / 2), static_cast<UINT>(dstH / 2)
+	};
+	mD3D11State->context->UpdateSubresource(
+		mD3D11State->yuvConstants.Get(), 0, nullptr, &dimensions, 0, 0);
 
-	const int cW = dstW / 2;
-	const int cH = dstH / 2;
+	ID3D11ShaderResourceView *shaderViews[2] = {
+		mD3D11State->nv12YView.Get(), mD3D11State->nv12UVView.Get()
+	};
+	ID3D11UnorderedAccessView *outputViews[3] = {
+		mD3D11State->yUav.Get(), mD3D11State->uUav.Get(),
+		mD3D11State->vUav.Get()
+	};
+	ID3D11Buffer *constantBuffers[1] = { mD3D11State->yuvConstants.Get() };
+	ID3D11SamplerState *samplers[1] = { mD3D11State->yuvSampler.Get() };
+	mD3D11State->context->CSSetShader(mD3D11State->yuvShader.Get(), nullptr, 0);
+	mD3D11State->context->CSSetShaderResources(0, 2, shaderViews);
+	mD3D11State->context->CSSetUnorderedAccessViews(0, 3, outputViews, nullptr);
+	mD3D11State->context->CSSetConstantBuffers(0, 1, constantBuffers);
+	mD3D11State->context->CSSetSamplers(0, 1, samplers);
+	mD3D11State->context->Dispatch(
+		(static_cast<UINT>(dstW) + 15) / 16,
+		(static_cast<UINT>(dstH) + 15) / 16, 1);
 
-	bool			ok    = false;
-	do
+	ID3D11ShaderResourceView *nullShaderViews[2] = {};
+	ID3D11UnorderedAccessView *nullOutputViews[3] = {};
+	ID3D11Buffer *nullConstantBuffers[1] = {};
+	ID3D11SamplerState *nullSamplers[1] = {};
+	mD3D11State->context->CSSetShader(nullptr, nullptr, 0);
+	mD3D11State->context->CSSetShaderResources(0, 2, nullShaderViews);
+	mD3D11State->context->CSSetUnorderedAccessViews(0, 3, nullOutputViews, nullptr);
+	mD3D11State->context->CSSetConstantBuffers(0, 1, nullConstantBuffers);
+	mD3D11State->context->CSSetSamplers(0, 1, nullSamplers);
+
+	mD3D11State->context->CopyResource(
+		mD3D11State->yStaging.Get(), mD3D11State->yTexture.Get());
+	mD3D11State->context->CopyResource(
+		mD3D11State->uStaging.Get(), mD3D11State->uTexture.Get());
+	mD3D11State->context->CopyResource(
+		mD3D11State->vStaging.Get(), mD3D11State->vTexture.Get());
+	if (!CopyMappedPlane(mD3D11State->context.Get(),
+			mD3D11State->yStaging.Get(), dstY, dstYRowBytes, dstW, dstH) ||
+		!CopyMappedPlane(mD3D11State->context.Get(),
+			mD3D11State->uStaging.Get(), dstU, dstURowBytes, dstW / 2, dstH / 2) ||
+		!CopyMappedPlane(mD3D11State->context.Get(),
+			mD3D11State->vStaging.Get(), dstV, dstVRowBytes, dstW / 2, dstH / 2))
 	{
-		if (mCudaYuvY == nullptr || mCudaYuvU == nullptr || mCudaYuvV == nullptr ||
-			mCudaYuvBufW != dstW || mCudaYuvBufH != dstH)
-		{
-			if (!FreeCudaYuvBuffersStrict())
-			{
-				MarkCudaCleanupFailed();
-								break;
-			}
-			void *p0 = nullptr, *p1 = nullptr, *p2 = nullptr;
-			if (cudaMallocPitch(&p0, &mCudaYuvYPitch, static_cast<size_t>(dstW), static_cast<size_t>(dstH)) != cudaSuccess) { break; }
-			mCudaYuvY = static_cast<uint8_t*>(p0);
-			if (cudaMallocPitch(&p1, &mCudaYuvUPitch, static_cast<size_t>(cW), static_cast<size_t>(cH)) != cudaSuccess) { break; }
-			mCudaYuvU = static_cast<uint8_t*>(p1);
-			if (cudaMallocPitch(&p2, &mCudaYuvVPitch, static_cast<size_t>(cW), static_cast<size_t>(cH)) != cudaSuccess) { break; }
-			mCudaYuvV = static_cast<uint8_t*>(p2);
-
-			mCudaYuvBufW = dstW;
-			mCudaYuvBufH = dstH;
-					}
-
-		void *streamVoid = nullptr;
-		bool queuedWait = false;
-		if (!PrepareCudaSurfaceRead(cudev, &streamVoid, &queuedWait))
-		{
-			break;
-		}
-		(void)queuedWait;
-		cudaStream_t stream = reinterpret_cast<cudaStream_t>(streamVoid);
-
-		if (mNppStreamCtx == nullptr)
-		{
-			break;
-		}
-		NppStreamContext &nppCtx = *static_cast<NppStreamContext*>(mNppStreamCtx);
-
-		const Npp8u *pSrc[2] = {
-			reinterpret_cast<const Npp8u*>(f->data[0]),
-			reinterpret_cast<const Npp8u*>(f->data[1])
-		};
-		Npp8u *pDst[3] = { mCudaYuvY, mCudaYuvU, mCudaYuvV };
-		int    aDstStep[3] = {
-			static_cast<int>(mCudaYuvYPitch),
-			static_cast<int>(mCudaYuvUPitch),
-			static_cast<int>(mCudaYuvVPitch)
-		};
-		const NppiSize roi = { dstW, dstH };
-
-		if (nppiNV12ToYUV420_8u_P2P3R_Ctx(pSrc, srcStep, pDst, aDstStep, roi, nppCtx) != NPP_SUCCESS)
-		{
-			break;
-		}
-
-
-		const bool canCopyDirect =
-			dstYRowBytes >= dstW &&
-			dstURowBytes >= cW &&
-			dstVRowBytes >= cW;
-
-		if (canCopyDirect)
-		{
-			if (cudaMemcpy2DAsync(dstY, static_cast<size_t>(dstYRowBytes),
-							  mCudaYuvY, mCudaYuvYPitch,
-							  static_cast<size_t>(dstW), static_cast<size_t>(dstH),
-							  cudaMemcpyDeviceToHost, stream) != cudaSuccess) { break; }
-			if (cudaMemcpy2DAsync(dstU, static_cast<size_t>(dstURowBytes),
-							  mCudaYuvU, mCudaYuvUPitch,
-							  static_cast<size_t>(cW), static_cast<size_t>(cH),
-							  cudaMemcpyDeviceToHost, stream) != cudaSuccess) { break; }
-			if (cudaMemcpy2DAsync(dstV, static_cast<size_t>(dstVRowBytes),
-							  mCudaYuvV, mCudaYuvVPitch,
-							  static_cast<size_t>(cW), static_cast<size_t>(cH),
-							  cudaMemcpyDeviceToHost, stream) != cudaSuccess) { break; }
-			if (cudaStreamSynchronize(stream) != cudaSuccess) { break; }
-		}
-		else
-		{
-			const size_t ySize = static_cast<size_t>(dstW) * static_cast<size_t>(dstH);
-			const size_t cSize = static_cast<size_t>(cW) * static_cast<size_t>(cH);
-			const size_t need  = ySize + cSize * 2;
-			if (!EnsurePinned(need))
-			{
-				break;
-			}
-			uint8_t *py = mPinnedStaging;
-			uint8_t *pu = py + ySize;
-			uint8_t *pv = pu + cSize;
-
-			if (cudaMemcpy2DAsync(py, static_cast<size_t>(dstW), mCudaYuvY, mCudaYuvYPitch,
-							  static_cast<size_t>(dstW), static_cast<size_t>(dstH),
-							  cudaMemcpyDeviceToHost, stream) != cudaSuccess) { break; }
-			if (cudaMemcpy2DAsync(pu, static_cast<size_t>(cW), mCudaYuvU, mCudaYuvUPitch,
-							  static_cast<size_t>(cW), static_cast<size_t>(cH),
-							  cudaMemcpyDeviceToHost, stream) != cudaSuccess) { break; }
-			if (cudaMemcpy2DAsync(pv, static_cast<size_t>(cW), mCudaYuvV, mCudaYuvVPitch,
-							  static_cast<size_t>(cW), static_cast<size_t>(cH),
-							  cudaMemcpyDeviceToHost, stream) != cudaSuccess) { break; }
-			if (cudaStreamSynchronize(stream) != cudaSuccess) { break; }
-
-			CopyPlaneRespectingRowBytes(dstY, dstYRowBytes, py, dstW, dstW, dstH);
-			CopyPlaneRespectingRowBytes(dstU, dstURowBytes, pu, cW,   cW,   cH);
-			CopyPlaneRespectingRowBytes(dstV, dstVRowBytes, pv, cW,   cW,   cH);
-		}
-
-				ok = true;
+		return false;
 	}
-	while (false);
-
-
-	const bool		popOk  = ctxGuard.pop();
-	if (!popOk)
-	{
-		MarkCudaCleanupFailed();
-				ok = false;
-	}
-
-
-	if (!ok && popOk)
-	{
-		if (!ReleaseCudaBuffersInCtx(mCudaCtx))
-		{
-			MarkCudaCleanupFailed();
-		}
-	}
-
-	return ok;
-#else
-	(void)view; (void)dstY; (void)dstYRowBytes; (void)dstU; (void)dstURowBytes;
-	(void)dstV; (void)dstVRowBytes; (void)dstW; (void)dstH;
-	return false;
-#endif
-}
-
-
-bool VideoDecoder::ReleaseCudaBuffers()
-{
-	const bool ok = ReleaseCudaBuffersInCtx(mCudaCtx);
-	if (!ok)
-	{
-		MarkCudaCleanupFailed();
-	}
-	return ok;
-}
-
-
-void VideoDecoder::MarkCudaCleanupFailed() noexcept
-{
-	mCudaCleanupFailed = true;
-	mDisableHw = true;
-	mNppDevReady = false;
-	mFallbackReason = "cuda-cleanup";
-}
-
-
-bool VideoDecoder::FreeCudaBuffersStrict()
-{
-#if VP9O_ENABLE_NPP
-	bool freeOk = true;
-	if (mCudaBgr)
-	{
-		if (cudaFree(mCudaBgr) == cudaSuccess) { mCudaBgr = nullptr; mCudaBgrPitch = 0; }
-		else { freeOk = false; }
-	}
-	if (mCudaBgra)
-	{
-		if (cudaFree(mCudaBgra) == cudaSuccess) { mCudaBgra = nullptr; mCudaBgraPitch = 0; }
-		else { freeOk = false; }
-	}
-	if (mCudaFlip)
-	{
-		if (cudaFree(mCudaFlip) == cudaSuccess) { mCudaFlip = nullptr; mCudaFlipPitch = 0; }
-		else { freeOk = false; }
-	}
-
-	if (freeOk)
-	{
-		mCudaBufW = 0;
-		mCudaBufH = 0;
-	}
-	return freeOk;
-#else
-	mCudaBgr = nullptr; mCudaBgra = nullptr; mCudaFlip = nullptr;
-	mCudaBgrPitch = 0; mCudaBgraPitch = 0; mCudaFlipPitch = 0;
-	mCudaBufW = 0; mCudaBufH = 0;
+	mFallbackReason = nullptr;
 	return true;
-#endif
 }
 
 
-bool VideoDecoder::FreeCudaYuvBuffersStrict()
+void VideoDecoder::ReleaseD3D11Resources() noexcept
 {
-#if VP9O_ENABLE_NPP
-	bool freeOk = true;
-	if (mCudaYuvY)
-	{
-		if (cudaFree(mCudaYuvY) == cudaSuccess) { mCudaYuvY = nullptr; mCudaYuvYPitch = 0; }
-		else { freeOk = false; }
-	}
-	if (mCudaYuvU)
-	{
-		if (cudaFree(mCudaYuvU) == cudaSuccess) { mCudaYuvU = nullptr; mCudaYuvUPitch = 0; }
-		else { freeOk = false; }
-	}
-	if (mCudaYuvV)
-	{
-		if (cudaFree(mCudaYuvV) == cudaSuccess) { mCudaYuvV = nullptr; mCudaYuvVPitch = 0; }
-		else { freeOk = false; }
-	}
-	if (freeOk)
-	{
-		mCudaYuvBufW = 0;
-		mCudaYuvBufH = 0;
-	}
-	return freeOk;
-#else
-	mCudaYuvY = nullptr; mCudaYuvU = nullptr; mCudaYuvV = nullptr;
-	mCudaYuvYPitch = 0; mCudaYuvUPitch = 0; mCudaYuvVPitch = 0;
-	mCudaYuvBufW = 0; mCudaYuvBufH = 0;
-	return true;
-#endif
-}
-
-
-bool VideoDecoder::DestroyStreamStrict()
-{
-#if VP9O_ENABLE_NPP
-	bool streamOk = true;
-	if (mCudaStream)
-	{
-		cudaStream_t s = reinterpret_cast<cudaStream_t>(mCudaStream);
-		if (cudaStreamDestroy(s) == cudaSuccess) { mCudaStream = nullptr; }
-		else { streamOk = false; }
-	}
-	return streamOk;
-#else
-	mCudaStream = nullptr;
-	return true;
-#endif
-}
-
-
-bool VideoDecoder::ReleaseCudaBuffersInCtx(void *ctxVoid)
-{
-#if VP9O_ENABLE_NPP
-	if (mCudaBgr == nullptr && mCudaBgra == nullptr && mCudaFlip == nullptr &&
-		mCudaYuvY == nullptr && mCudaYuvU == nullptr && mCudaYuvV == nullptr &&
-		mCudaStream == nullptr && mCudaProducerEvent == nullptr)
-	{
-		mCudaBufW = 0; mCudaBufH = 0; mCudaYuvBufW = 0; mCudaYuvBufH = 0;
-		mCudaCtx = nullptr; mNppDevReady = false; mNppStream = nullptr;
-		return true;
-	}
-	if (ctxVoid == nullptr)
-	{
-		return false;
-	}
-
-	CUcontext ctx = reinterpret_cast<CUcontext>(ctxVoid);
-	if (cuCtxPushCurrent(ctx) != CUDA_SUCCESS)
-	{
-		return false;
-	}
-
-	const bool freeOk    = FreeCudaBuffersStrict();
-	const bool freeYuvOk = FreeCudaYuvBuffersStrict();
-	const bool eventOk   = DestroyCudaEventStrict();
-	const bool streamOk  = DestroyStreamStrict();
-
-
-	CUcontext		popped = nullptr;
-	const CUresult	popRes = cuCtxPopCurrent(&popped);
-
-
-	if (!freeOk)
-	{
-
-		mNppDevReady = false;
-		return false;
-	}
-	if (!freeYuvOk)
-	{
-
-		mNppDevReady = false;
-		return false;
-	}
-	if (!streamOk)
-	{
-
-		mNppDevReady = false;
-		return false;
-	}
-	if (!eventOk)
-	{
-
-		mNppDevReady = false;
-		return false;
-	}
-	if (popRes != CUDA_SUCCESS)
-	{
-
-		mNppDevReady = false;
-		return false;
-	}
-
-	mCudaCtx = nullptr; mNppDevReady = false; mNppStream = nullptr;
-	return true;
-#else
-	(void)ctxVoid;
-	FreeCudaBuffersStrict();
-	FreeCudaYuvBuffersStrict();
-	DestroyCudaEventStrict();
-	DestroyStreamStrict();
-	mCudaCtx = nullptr; mNppDevReady = false; mNppStream = nullptr;
-	return true;
-#endif
+	delete mD3D11State;
+	mD3D11State = nullptr;
 }

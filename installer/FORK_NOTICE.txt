@@ -1,0 +1,10 @@
+WebMiere D3D11VA Community Fork
+
+This is an independent community build maintained at:
+https://github.com/moesuito/webmiere-d3d11va
+
+It is based on KawaiiEngine/WebMiere but is not an official KawaiiEngine release.
+
+Fork features include vendor-neutral D3D11VA video decode, GPU pixel conversion and proxy-resolution scaling, packaged universal audio decoding, and AV1-in-MP4 support with native Premiere fallback for other MP4 codecs.
+
+WebMiere, Mina, Miere, and the original artwork remain the property of KawaiiEngine (Sashimiso). This installer intentionally uses the standard Inno Setup presentation and does not include the proprietary original installer artwork.

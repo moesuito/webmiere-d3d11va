@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.0-d3d11va.1 — 2026-08-03
+
+- Replaced the CUDA/NPP video path with vendor-neutral FFmpeg D3D11VA decode.
+- Added D3D11 Video Processor and compute-shader conversion/scaling for Premiere Full, 1/2, and 1/4 requests.
+- Retained automatic FFmpeg software decode and `swscale` fallback.
+- Added packaged universal audio decoding for supported mono/stereo streams.
+- Added narrowly scoped AV1-in-MP4 import while returning non-AV1 MP4 to Premiere's native importer.
+- Added repeatable smoke tests, transactional local installation, and an unsigned Inno Setup package for the community fork.
+
 ## 1.2.2 — 2026-07-29
 
 - First release in the reorganized public repository.

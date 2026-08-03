@@ -172,19 +172,15 @@ bool AudioDecoder::Open(const prUTF16Char *path, int ffmpegAudioStreamIndex)
 	}
 
 
-	if (st->codecpar->codec_id != AV_CODEC_ID_OPUS)
+	if (st->codecpar->ch_layout.nb_channels < 1 ||
+		st->codecpar->ch_layout.nb_channels > 2)
 	{
 		Close();
 		return false;
 	}
 
-	if (st->codecpar->ch_layout.nb_channels != 2)
-	{
-		Close();
-		return false;
-	}
-
-	if (st->codecpar->sample_rate != 48000)
+	if (st->codecpar->sample_rate <= 0 ||
+		st->time_base.num <= 0 || st->time_base.den <= 0)
 	{
 		Close();
 		return false;
@@ -215,11 +211,7 @@ bool AudioDecoder::Open(const prUTF16Char *path, int ffmpegAudioStreamIndex)
 	}
 
 	mSampleRate  = st->codecpar->sample_rate;
-	if (mSampleRate <= 0)
-	{
-		mSampleRate = 48000;
-	}
-	mOutChannels = 2;
+	mOutChannels = st->codecpar->ch_layout.nb_channels;
 	mTimeBaseNum = st->time_base.num;
 	mTimeBaseDen = st->time_base.den;
 	const int64_t rawStartTime = (st->start_time == AV_NOPTS_VALUE) ? 0 : st->start_time;
@@ -791,7 +783,8 @@ int64_t AudioDecoder::ReadSamples(int64_t startSample, int64_t numSamples, float
 
 	if (mHeadSample != startSample)
 	{
-		if (!SeekToSample(startSample))
+		const bool alreadyAtStart = (mHeadSample < 0 && startSample == 0);
+		if (!alreadyAtStart && !SeekToSample(startSample))
 		{
 			return 0;
 		}

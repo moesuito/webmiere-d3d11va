@@ -21,7 +21,7 @@ struct AVCodecContext;
 struct AVFrame;
 struct AVPacket;
 struct SwsContext;
-struct AVCUDADeviceContext;
+struct Vp9oD3D11State;
 
 struct Vp9oDecodedFrameView
 {
@@ -29,7 +29,7 @@ struct Vp9oDecodedFrameView
 	int				width;
 	int				height;
 	int				avPixelFormat;
-	bool			isCuda;
+	bool			isD3D11;
 	const uint8_t	*data[4];
 	int				linesize[4];
 };
@@ -90,27 +90,13 @@ private:
 	bool	ConvertToBGRA(const AVFrame *f, uint8_t *dst, int dstRowBytes, int dstW, int dstH);
 
 
-	bool	ConvertToBGRA_CUDA(const AVFrame *f, uint8_t *dst, int dstRowBytes, int dstW, int dstH);
-
-
-	bool	ConvertCudaNV12ToYUV420P(const Vp9oDecodedFrameView &view,
+	bool	ConvertToBGRA_D3D11(const AVFrame *f, uint8_t *dst, int dstRowBytes, int dstW, int dstH);
+	bool	ConvertD3D11NV12ToYUV420P(const Vp9oDecodedFrameView &view,
 									 uint8_t *dstY, int dstYRowBytes,
 									 uint8_t *dstU, int dstURowBytes,
 									 uint8_t *dstV, int dstVRowBytes,
 									 int dstW, int dstH);
-	bool	FreeCudaYuvBuffersStrict();
-
-	bool	EnsureCudaConsumerStream(void **outStream) noexcept;
-	bool	EnsureNppStreamContext(void *stream) noexcept;
-	bool	PrepareCudaSurfaceRead(AVCUDADeviceContext *cudaDev, void **outStream, bool *outQueuedWait) noexcept;
-	bool	DestroyCudaEventStrict() noexcept;
-	bool	ReleaseCudaBuffers();
-	bool	ReleaseCudaBuffersInCtx(void *ctx);
-	bool	FreeCudaBuffersStrict();
-	bool	DestroyStreamStrict();
-	bool	BuildNppStreamContext(void *stream) noexcept;
-	bool	EnsurePinned(size_t bytes);
-	void	MarkCudaCleanupFailed() noexcept;
+	void	ReleaseD3D11Resources() noexcept;
 
 
 	AVFormatContext	*mFmt;
@@ -168,45 +154,7 @@ private:
 	int						mSwsYuvDstH;
 
 
-	uint8_t			*mCudaBgr;
-	uint8_t			*mCudaBgra;
-	uint8_t			*mCudaFlip;
-	size_t			mCudaBgrPitch;
-	size_t			mCudaBgraPitch;
-	size_t			mCudaFlipPitch;
-	int				mCudaBufW;
-	int				mCudaBufH;
-
-
-	uint8_t			*mCudaYuvY;
-	uint8_t			*mCudaYuvU;
-	uint8_t			*mCudaYuvV;
-	size_t			mCudaYuvYPitch;
-	size_t			mCudaYuvUPitch;
-	size_t			mCudaYuvVPitch;
-	int				mCudaYuvBufW;
-	int				mCudaYuvBufH;
-	void			*mCudaCtx;
-	void			*mCudaStream;
-	bool			mCudaCleanupFailed;
-
-	bool			mNppDevReady;
-	int				mNppDeviceId;
-	int				mNppMpCount;
-	int				mNppMaxThreadsPerMp;
-	int				mNppMaxThreadsPerBlock;
-	size_t			mNppSharedMemPerBlock;
-	int				mNppCcMajor;
-	int				mNppCcMinor;
-	unsigned int	mNppStreamFlags;
-	void			*mNppStreamCtx;
-	void			*mNppStream;
-	int				mCudaSyncMode;
-	void			*mCudaProducerEvent;
-	void			*mCudaProducerEventCtx;
-
-	uint8_t			*mPinnedStaging;
-	size_t			mPinnedCapacity;
+	Vp9oD3D11State	*mD3D11State;
 
 	std::string	mPathUtf8;
 	bool		mOpened;

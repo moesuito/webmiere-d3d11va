@@ -4,12 +4,13 @@ This file summarizes factual third-party licensing and distribution information 
 
 ## WebMiere Licensing Scope
 
-- Publisher: KawaiiEngine
+- Community-fork publisher: moesuito
+- Upstream project: KawaiiEngine/WebMiere
 - Copyright: Copyright (c) 2026 KawaiiEngine (Sashimiso)
 - Source files under `src/`: Mozilla Public License 2.0
 - Installed source license text: `assets\licenses\WebMiere-MPL-2.0.txt`
-- Corresponding source for this release: https://github.com/KawaiiEngine/WebMiere/releases/
-- Official prebuilt binaries and the installer are distributed under separate terms. Those terms do not limit the rights granted under the MPL-2.0 to the source files under `src/`.
+- Corresponding source for this fork release: https://github.com/moesuito/webmiere-d3d11va/releases/
+- Community-fork binaries and the installer do not limit the rights granted under the MPL-2.0 to the source files under `src/`.
 - The installer, artwork, characters, logos, branding, and other materials are not licensed under the MPL unless expressly stated.
 
 ## Adobe Premiere Pro C++ SDK
@@ -20,14 +21,13 @@ This file summarizes factual third-party licensing and distribution information 
 
 ## FFmpeg
 
-WebMiere dynamically links to the current KawaiiEngine shared FFmpeg build.
+This fork dynamically links to its packaged shared FFmpeg build.
 
 - FFmpeg version: 8.1.2
 - FFmpeg commit: `38b88335f99e76ed89ff3c93f877fdefce736c13`
-- Build identity: `n8.1.2-kawaiiengine-webmiere`
+- Build identity: `8.1.2-kawaiiengine-webmiere-d3d11va`
 - License reported by the runtime: `LGPL version 3 or later`
-- Build repository: `KawaiiEngine/WebMiere-FFmpeg`
-- Corresponding factory Release: https://github.com/KawaiiEngine/WebMiere-FFmpeg/releases/tag/ffmpeg-webmiere-8.1.2-4
+- Original source bundle: `KawaiiEngine/WebMiere-FFmpeg` release `ffmpeg-webmiere-8.1.2-4`
 - Linkage: dynamic/shared DLL linkage
 - Local FFmpeg source changes: none
 - Installed license texts: `assets\licenses\FFmpeg-COPYING.LGPLv3.txt` and `assets\licenses\FFmpeg-COPYING.GPLv3.txt`
@@ -42,9 +42,9 @@ swscale-9.dll
 swresample-6.dll
 ```
 
-The exact FFmpeg source archives, build information, configuration records, license records, source-change diff, SHA-256 manifests, and provenance records are included at `assets\licenses\source\FFmpeg-WebMiere-8.1.2-4-Corresponding-Source.zip`.
+The exact FFmpeg and dav1d source archives, D3D11VA build configuration, and license records are included at `assets\licenses\source\WebMiere-D3D11VA-FFmpeg-8.1.2-Corresponding-Source.zip`.
 
-The normal AV1 path uses NVIDIA AV1 hardware decode. CPU decoding is a diagnostic/development path: AV1 CPU decode uses libdav1d, while VP9 CPU decode uses the FFmpeg native decoder.
+The normal hardware path uses FFmpeg D3D11VA through the installed AMD, Intel, or NVIDIA driver. AV1 software fallback uses libdav1d; VP9 software fallback uses the FFmpeg native decoder.
 
 ## dav1d
 
@@ -54,35 +54,12 @@ The normal AV1 path uses NVIDIA AV1 hardware decode. CPU decoding is a diagnosti
 - Linkage: the static dav1d library is linked into FFmpeg `avcodec-62.dll`.
 - No separate `dav1d.dll` or `libdav1d.dll` is shipped.
 - Installed license text: `assets\licenses\dav1d-COPYING.BSD-2-Clause.txt`, copied from the exact pinned upstream `COPYING`.
-- The exact corresponding dav1d source archive and build records are included in `assets\licenses\source\FFmpeg-WebMiere-8.1.2-4-Corresponding-Source.zip`.
+- The exact corresponding dav1d source archive and build records are included in `assets\licenses\source\WebMiere-D3D11VA-FFmpeg-8.1.2-Corresponding-Source.zip`.
 
-## nv-codec-headers
+## Direct3D 11
 
-- Version: 13.0.19.0
-- Commit: `e844e5b26f46bb77479f063029595293aa8f812d`
-- Used to build FFmpeg NVDEC support.
-- The source archive is included in `assets\licenses\source\FFmpeg-WebMiere-8.1.2-4-Corresponding-Source.zip` with the FFmpeg source material.
-- Installed license notices: `assets\licenses\nv-codec-headers-MIT.txt`, extracted verbatim from the pinned source headers.
-- The headers carry complete MIT-style copyright, permission, and disclaimer notices in the pinned source archive.
-
-## NVIDIA CUDA and NPP
-
-- WebMiere uses CUDA Runtime and NVIDIA Performance Primitives.
-- Only runtime DLLs required by the final WebMiere binary may be redistributed.
-- The complete CUDA Toolkit, compilers, headers, development tools, and import libraries must not be included in the end-user package.
-- Installed license text: `assets\licenses\NVIDIA-CUDA-Toolkit-12.9-EULA.txt`, copied from the CUDA Toolkit 12.9 EULA used for this build.
-- The final CUDA/NPP runtime DLL allowlist for this release is:
-
-```text
-cudart64_12.dll
-nppc64_12.dll
-nppicc64_12.dll
-nppidei64_12.dll
-nppig64_12.dll
-```
-
-- `nppc64_12.dll` is not a direct delay-load dependency of `WebMiere.prm`, but it is required by the shipped NPP runtime set and is preloaded with the other NVIDIA runtime DLLs.
-- `nvcuda.dll` is supplied by the installed NVIDIA graphics driver and must not be bundled.
+- D3D11VA, the D3D11 Video Processor, and the compute-shader path use Windows and GPU-driver interfaces supplied by Microsoft and the installed hardware vendor.
+- No CUDA, NPP, NVDEC SDK, AMF, Media Foundation, DXVA2, D3D12VA, or vendor runtime DLL is bundled by this fork.
 
 ## Microsoft Runtime
 
@@ -95,7 +72,7 @@ nppig64_12.dll
 
 ## Installer
 
-- The WebMiere setup executable is built with Inno Setup; see the Inno Setup project for its license terms.
+- The community-fork setup executable is built with Inno Setup; see the Inno Setup project for its license terms.
 
 ## Installer and Brand Assets
 
@@ -105,5 +82,4 @@ nppig64_12.dll
   and character assets are proprietary and all rights are reserved.
 - Their use is governed by `ARTWORK_POLICY.md`.
 - Non-commercial fan art is welcome under that policy.
-- No third-party artwork or icons are included unless explicitly
-  identified in this notice.
+- The community-fork installer uses the standard Inno Setup presentation and does not bundle the proprietary WebMiere installer artwork or icons.
