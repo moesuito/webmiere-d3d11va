@@ -567,11 +567,10 @@ struct Vp9oRuntimeLoaderState
 	DWORD					error;
 	int						moduleCount;
 	int						dirCount;
-	HMODULE					modules[10];
-	DLL_DIRECTORY_COOKIE	dirCookies[2];
+	HMODULE					modules[5];
+	DLL_DIRECTORY_COOKIE	dirCookies[1];
 	wchar_t					errorPath[kVp9oRuntimePathMax];
 	wchar_t					errorMessage[1024];
-	wchar_t					cudartPath[kVp9oRuntimePathMax];
 };
 
 static std::once_flag gRuntimeLoaderOnce;
@@ -899,41 +898,6 @@ Vp9oLoadRuntimeDll(Vp9oRuntimeLoaderState *state, const wchar_t *path)
 
 
 static bool
-Vp9oLoadCudart(Vp9oRuntimeLoaderState *state, const wchar_t *nvidiaDir)
-{
-	HMODULE existing = GetModuleHandleW(L"cudart64_12.dll");
-	if (existing != nullptr)
-	{
-		const DWORD len = GetModuleFileNameW(
-			existing,
-			state->cudartPath,
-			static_cast<DWORD>(sizeof(state->cudartPath) / sizeof(state->cudartPath[0])));
-		if (len == 0)
-		{
-			return Vp9oSetRuntimeFailure(state, L"cudart64_12.dll", GetLastError());
-		}
-		if (len >= sizeof(state->cudartPath) / sizeof(state->cudartPath[0]))
-		{
-			return Vp9oSetRuntimeFailure(state, L"cudart64_12.dll", ERROR_INSUFFICIENT_BUFFER);
-		}
-		return Vp9oLoadRuntimeDll(state, state->cudartPath);
-	}
-
-	wchar_t path[kVp9oRuntimePathMax] = {};
-	if (!Vp9oAppendLeaf(nvidiaDir, L"cudart64_12.dll", path, kVp9oRuntimePathMax))
-	{
-		return Vp9oSetRuntimeFailure(state, nvidiaDir, ERROR_INSUFFICIENT_BUFFER);
-	}
-	if (!Vp9oLoadRuntimeDll(state, path))
-	{
-		return false;
-	}
-	Vp9oCopyWide(state->cudartPath, sizeof(state->cudartPath) / sizeof(state->cudartPath[0]), path);
-	return true;
-}
-
-
-static bool
 Vp9oLoadRuntimeDllFromDir(Vp9oRuntimeLoaderState *state, const wchar_t *dir, const wchar_t *name)
 {
 	wchar_t path[kVp9oRuntimePathMax] = {};
@@ -951,11 +915,9 @@ Vp9oRuntimeLoaderOnce()
 	Vp9oRuntimeLoaderState *state = &gRuntimeLoaderState;
 	wchar_t pluginDir[kVp9oRuntimePathMax] = {};
 	wchar_t ffmpegDir[kVp9oRuntimePathMax] = {};
-	wchar_t nvidiaDir[kVp9oRuntimePathMax] = {};
 
 	if (!Vp9oGetPluginDirectory(pluginDir, kVp9oRuntimePathMax, state) ||
-		!Vp9oAppendLeaf(pluginDir, L"ffmpeg", ffmpegDir, kVp9oRuntimePathMax) ||
-		!Vp9oAppendLeaf(pluginDir, L"nvidia", nvidiaDir, kVp9oRuntimePathMax))
+		!Vp9oAppendLeaf(pluginDir, L"ffmpeg", ffmpegDir, kVp9oRuntimePathMax))
 	{
 		if (state->error == 0)
 		{
@@ -965,12 +927,6 @@ Vp9oRuntimeLoaderOnce()
 	}
 
 	if (!Vp9oAddRuntimeDirectory(state, ffmpegDir) ||
-		!Vp9oAddRuntimeDirectory(state, nvidiaDir) ||
-		!Vp9oLoadCudart(state, nvidiaDir) ||
-		!Vp9oLoadRuntimeDllFromDir(state, nvidiaDir, L"nppc64_12.dll") ||
-		!Vp9oLoadRuntimeDllFromDir(state, nvidiaDir, L"nppicc64_12.dll") ||
-		!Vp9oLoadRuntimeDllFromDir(state, nvidiaDir, L"nppidei64_12.dll") ||
-		!Vp9oLoadRuntimeDllFromDir(state, nvidiaDir, L"nppig64_12.dll") ||
 		!Vp9oLoadRuntimeDllFromDir(state, ffmpegDir, L"avutil-60.dll") ||
 		!Vp9oLoadRuntimeDllFromDir(state, ffmpegDir, L"swresample-6.dll") ||
 		!Vp9oLoadRuntimeDllFromDir(state, ffmpegDir, L"swscale-9.dll") ||
